@@ -1,6 +1,6 @@
 # Multicamera Calibration Library
 
-Working in progress..
+Work in progress..
 
 ## Installation
 For installing, we recommend using [uv](https://docs.astral.sh/uv/) for fast and reliable package management:

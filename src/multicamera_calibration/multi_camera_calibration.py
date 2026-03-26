@@ -57,12 +57,13 @@ class MultiCameraCalibration:
             os.remove(db_path)
 
         self.db_path = Path(db_path)
-        self.image_path = Path(image_path) / "rig1" / "cam0"
+        self.image_path = Path(image_path)
+        cam0_image_path = Path(image_path) / "rig1" / "cam0"
 
         db = pycolmap.Database.open(db_path)
         cam0 = self.calib.get("cam0")
         cam1 = self.calib.get("cam1")
-        frames = os.listdir(image_path)
+        frames = os.listdir(cam0_image_path)
 
         # Create cameras
         camera0 = pycolmap.Camera(cam0)
