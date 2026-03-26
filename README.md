@@ -27,3 +27,11 @@ Change paths in main() and then run:
 ```
 python run_calibration.py
 ```
+
+## Todo
+
+- [ ] Add image quality check
+- [ ] Add automatic detection
+- [ ] Add ceres BA with targets
+- [ ] Add scaling with scalebars
+

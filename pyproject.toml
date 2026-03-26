@@ -12,17 +12,14 @@ authors = [
 ]
 requires-python = ">=3.9"
 keywords = [
-  "odometry",
-  "visual-slam",
-  "image-matching",
-  "deep-learning",
-  "local-features",
+  "calibration",
+  "multi-camera",
   "sfm",
 ]
 
 dependencies = [
-  "numpy",
-  "pyyaml",
+  "numpy==2.2.6",
+  "pyyaml==6.0.3",
   "pycolmap==4.0.2",
 ]
 
@@ -32,10 +29,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/3DOM-FBK/colmap-odometry"
-Documentation = "https://github.com/3DOM-FBK/colmap-odometry"
-Download = "https://github.com/3DOM-FBK/colmap-odometry"
-"Source Code" = "https://github.com/3DOM-FBK/colmap-odometry"
+Homepage = "https://github.com/3DOM-FBK/"
+Documentation = "https://github.com/3DOM-FBK/"
+Download = "https://github.com/3DOM-FBK/"
+"Source Code" = "https://github.com/3DOM-FBK/"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/multicamera_calibration"]
