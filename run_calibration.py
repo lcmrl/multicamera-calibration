@@ -9,6 +9,8 @@ def main():
 
     calib_file = "calibration.yaml"
     rig_file = "camera_rig.yaml"
+    db_path = "db.db"
+    image_path = "assets/images"  # Example image path, adjust as needed
 
     # Initialize the calibration object
     multicamera_calib = MultiCameraCalibration()
@@ -21,6 +23,9 @@ def main():
         print(f"Rig configuration: {multicamera_calib.rig}")
     except (FileNotFoundError, yaml.YAMLError) as e:
         print(f"Error: {e}")
+
+    # Initialize the database
+    multicamera_calib.database_initialization(db_path, image_path)
 
 
 if __name__ == "__main__":
