@@ -1,6 +1,7 @@
 # Multicamera Calibration Library
 
-Work in progress..
+Multicamera calibration based on pycolmap.
+
 
 ## Installation
 For installing, we recommend using [uv](https://docs.astral.sh/uv/) for fast and reliable package management:
@@ -18,4 +19,11 @@ Then, you can install using uv:
 
 ```bash
 uv pip install -e .
+```
+
+## Example usage
+Change paths in main() and then run:
+
+```
+python run_calibration.py
 ```
