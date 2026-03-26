@@ -17,6 +17,7 @@ class MultiCameraCalibration:
         self.rig = None
         self.db_path = None
         self.image_path = None
+        self.output_path = None
         self.image_to_id_dict = {}  # Mapping from image names to their corresponding IDs in the database
         self.id_to_image_dict = {}  # Mapping from database IDs to their corresponding image names
 
@@ -139,5 +140,11 @@ class MultiCameraCalibration:
 
         return db
     
-    def run(self):
-        self.database_initialization()
+    def reconstruct(self, output_path: str):
+
+        self.output_path = Path(output_path)
+
+        pycolmap.extract_features(self.db_path, self.image_path)
+        pycolmap.match_exhaustive(self.db_path)
+        maps = pycolmap.incremental_mapping(self.db_path, self.image_path, self.output_path)
+        maps[0].write(self.output_path)

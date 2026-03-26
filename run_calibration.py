@@ -10,7 +10,8 @@ def main():
     calib_file = "calibration.yaml"
     rig_file = "camera_rig.yaml"
     db_path = "db.db"
-    image_path = "assets/images"  # Example image path, adjust as needed
+    image_path = "assets/images"
+    output_path = "output"
 
     # Initialize the calibration object
     multicamera_calib = MultiCameraCalibration()
@@ -26,6 +27,9 @@ def main():
 
     # Initialize the database
     multicamera_calib.database_initialization(db_path, image_path)
+
+    # Run the reconstruction process
+    multicamera_calib.reconstruct(output_path)
 
 
 if __name__ == "__main__":
