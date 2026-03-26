@@ -2,6 +2,7 @@
 
 import os
 import yaml
+import shutil
 import pycolmap
 import numpy as np
 
@@ -140,12 +141,41 @@ class MultiCameraCalibration:
             db.write_frame(colmap_frame)
 
         return db
-    
-    def reconstruct(self, output_path: str):
+
+    def run_calibration(self, output_path: str, known_distance_cam0_cam1: float):
 
         self.output_path = Path(output_path)
+        if os.path.exists(self.output_path):
+            shutil.rmtree(self.output_path)
 
         pycolmap.extract_features(self.db_path, self.image_path)
         pycolmap.match_exhaustive(self.db_path)
         maps = pycolmap.incremental_mapping(self.db_path, self.image_path, self.output_path)
-        maps[0].write(self.output_path)
+        maps[0].write_text(self.output_path)
+
+        #print(maps[0].cameras)
+        #print(maps[0].images)
+        #rig1 = maps[0].rig(rig_id=1)
+        #print(dir(rig1))
+
+        with open(self.output_path / "cameras.txt", 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                if line.startswith("1 "):
+                    cam0_params = list(map(float, line.split()[4:]))
+                elif line.startswith("2 "):
+                    cam1_params = list(map(float, line.split()[4:]))
+        print("Camera 0 parameters:", cam0_params)
+        print("Camera 1 parameters:", cam1_params)
+
+        with open(self.output_path / "rigs.txt", 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                if line.startswith("1 "):
+                    rig_params = list(map(float, line.split()[7:]))
+                    rotation = np.array(rig_params[:4])
+                    translation = np.array(rig_params[4:])
+                    scale_factor = np.linalg.norm(translation) / known_distance_cam0_cam1
+                    translation /= scale_factor
+
+        print("Rig parameters (cam1 relative to cam0):", "rotation:", rotation, "translation:", translation)

@@ -12,6 +12,7 @@ def main():
     db_path = "db.db"
     image_path = "assets/images"
     output_path = "output"
+    known_distance_cam0_cam1 = 0.263 # Distance in meters between cam0 and cam1, used for scale estimation
 
     # Initialize the calibration object
     multicamera_calib = MultiCameraCalibration()
@@ -29,7 +30,7 @@ def main():
     multicamera_calib.database_initialization(db_path, image_path)
 
     # Run the reconstruction process
-    multicamera_calib.reconstruct(output_path)
+    multicamera_calib.run_calibration(output_path, known_distance_cam0_cam1)
 
 
 if __name__ == "__main__":
