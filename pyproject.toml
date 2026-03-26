@@ -22,6 +22,7 @@ keywords = [
 
 dependencies = [
   "numpy",
+  "pyyaml",
   "pycolmap==4.0.2",
 ]
 
