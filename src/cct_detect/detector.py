@@ -60,37 +60,37 @@ class Detection:
 # ---------------------------------------------------------------------------
 
 class CCTDetector:
-    def __init__(self, n_bits: int = 14):
+    def __init__(self, n_bits: int = 14,
+                 valid_id_range: tuple[int, int] | None = None):
         self.n_bits = n_bits
+        self.valid_id_range = valid_id_range  # (min_id, max_id) inclusive, or None
 
     # ---- 1. candidate ellipses ------------------------------------------
 
-    def _find_candidates(self, gray: np.ndarray, min_circ: float = 0.75):
+    def _find_candidates(self, gray: np.ndarray, min_circ: float = 0.60):
         """
         Find ellipse candidates from multiple binarisations.
-        Higher circularity threshold than before - real CCT inner circles
-        are very circular even under moderate perspective.
         """
         H, W = gray.shape[:2]
         min_area = max(30, int(H * W * 1e-6))
-        max_area = int(H * W * 0.005)
+        max_area = int(H * W * 0.008)
 
         scored: list[tuple[float, tuple]] = []
 
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
 
-        # Otsu
+        # Otsu with broader offset sweep
         otsu_val, _ = cv2.threshold(blurred, 0, 255,
                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         binaries = []
-        for off in (-20, -10, 0, 10, 20):
+        for off in (-30, -20, -10, 0, 10, 20, 30):
             tv = int(np.clip(otsu_val + off, 30, 230))
             _, bw = cv2.threshold(blurred, tv, 255, cv2.THRESH_BINARY)
             binaries.append(bw)
 
         # Adaptive
-        for bs in (31, 61):
-            for C in (10, 20):
+        for bs in (31, 61, 91):
+            for C in (5, 10, 20):
                 bw = cv2.adaptiveThreshold(
                     blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                     cv2.THRESH_BINARY, bs, -C,
@@ -117,7 +117,7 @@ class CCTDetector:
                 (cx, cy), (aw, ah), ang = ell
                 major = max(aw, ah) / 2.0
                 minor = min(aw, ah) / 2.0
-                if major < 5 or minor < 4 or major > 80:
+                if major < 5 or minor < 4 or major > 150:
                     continue
                 if minor / (major + 1e-9) < 0.3:
                     continue
@@ -151,13 +151,22 @@ class CCTDetector:
         major3 = max(aw, ah) * 1.6  # a bit more than 3x radius
         half = int(math.ceil(major3))
 
-        # Source ROI (may be clipped)
+        # Source ROI — pad image if near border rather than rejecting
         r_min = int(round(cy - half))
         r_max = int(round(cy + half))
         c_min = int(round(cx - half))
         c_max = int(round(cx + half))
         if r_min < 0 or c_min < 0 or r_max > H or c_max > W:
-            return None
+            pad = half + 2
+            gray = cv2.copyMakeBorder(gray, pad, pad, pad, pad,
+                                      cv2.BORDER_REFLECT_101)
+            cx += pad
+            cy += pad
+            H, W = gray.shape[:2]
+            r_min = int(round(cy - half))
+            r_max = int(round(cy + half))
+            c_min = int(round(cx - half))
+            c_max = int(round(cx + half))
 
         # Build affine: map 3x-ellipse bounding box corners to square
         theta = math.radians(ang)
@@ -242,10 +251,10 @@ class CCTDetector:
         if n_valid == 0:
             return False
 
-        # Strict checks (allow small tolerance for perspective residuals)
-        if n_white_center < sample_n * 0.85:
+        # Allow tolerance for perspective residuals and uneven illumination
+        if n_white_center < sample_n * 0.70:
             return False
-        if n_black_guard < sample_n * 0.85:
+        if n_black_guard < sample_n * 0.70:
             return False
         n_black_code = sample_n - n_white_code
         if n_white_code < 2 or n_black_code < 2:
@@ -297,7 +306,7 @@ class CCTDetector:
         step = n_ang / self.n_bits
         p_lo = np.percentile(smooth, 15)
         p_hi = np.percentile(smooth, 85)
-        if p_hi - p_lo < 15:
+        if p_hi - p_lo < 8:
             return None
         thresh = (p_lo + p_hi) / 2.0
 
@@ -350,15 +359,15 @@ class CCTDetector:
 
         canon, raw, bits, margin, pat, mse = best
         range_sq = (p_hi - p_lo) ** 2
-        if range_sq > 0 and mse / range_sq > 0.020:
+        if range_sq > 0 and mse / range_sq > 0.030:
             return None
 
-        # Reject trivially simple codes (e.g. ID 1, 3, 7) which are
-        # common false positives from noise.
+        # Reject block codes (e.g. 0000001111111) — real CCT codes have >= 4
+        # transitions between sectors; simple all-ones blocks are noise FPs.
         n1 = sum(bits)
         transitions = sum(1 for i in range(self.n_bits)
                          if bits[i] != bits[(i + 1) % self.n_bits])
-        if n1 < 4 and transitions < 4:
+        if transitions < 4:
             return None
 
         return canon, raw, bits, margin, pat
@@ -367,6 +376,9 @@ class CCTDetector:
 
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        # Apply CLAHE on the full image to improve contrast in dark regions
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
         candidates = self._find_candidates(gray)
 
         # Process largest candidates first (better decode quality)
@@ -395,13 +407,14 @@ class CCTDetector:
 
             canon, raw, bits, margin, pat = result
 
-            # Dedup: use a radius that covers the full target extent
-            # (target outer edge ≈ 3× the fitted inner-circle radius)
+            # Dedup: full target outer edge ≈ 3× inner-circle radius;
+            # use 4× to also catch candidates from outer rings of the same
+            # target while not eating adjacent distinct targets.
             c_arr = np.array([cx, cy])
             dup = False
             for i, uc in enumerate(used):
                 det_r = max(detections[i].ellipse[1]) / 2.0
-                dup_r = max(15.0, max(r, det_r) * 3.5)
+                dup_r = max(20.0, max(r, det_r) * 4.0)
                 if np.linalg.norm(c_arr - uc) < dup_r:
                     if margin > detections[i].confidence:
                         detections[i] = Detection(
@@ -421,7 +434,27 @@ class CCTDetector:
                 used.append(c_arr)
 
         detections.sort(key=lambda d: (d.center[1], d.center[0]))
-        return detections
+
+        # Final ID-level dedup: if the same target_id appears more than once,
+        # keep only the highest-confidence instance.
+        seen: dict[int, int] = {}  # target_id -> index in best_detections
+        best_detections: list[Detection] = []
+        for det in detections:
+            if det.target_id in seen:
+                idx = seen[det.target_id]
+                if det.confidence > best_detections[idx].confidence:
+                    best_detections[idx] = det
+            else:
+                seen[det.target_id] = len(best_detections)
+                best_detections.append(det)
+        best_detections.sort(key=lambda d: (d.center[1], d.center[0]))
+
+        # Filter by valid ID range if specified
+        if self.valid_id_range is not None:
+            lo, hi = self.valid_id_range
+            best_detections = [d for d in best_detections if lo <= d.target_id <= hi]
+
+        return best_detections
 
     # ---- 6. annotation ---------------------------------------------------
 

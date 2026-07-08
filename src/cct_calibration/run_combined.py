@@ -11,6 +11,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -32,10 +33,12 @@ from cct_calibration.run import (
     ReprojectionCost,
     SolverDiagnostics,
     _load_detections_cct_detect,
+    camera_center_from_pose,
     collect_observations,
     compute_reprojection_errors,
     distortion_vector,
     filter_images_for_bundle,
+    initialize_known_target_state,
     intrinsics_matrix,
     normalize_target_id,
     project_point,
@@ -46,6 +49,37 @@ from cct_calibration.run import (
     triangulate_two_views,
     _filter_inlier_observations,
 )
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_known_baseline_argument(raw: object) -> tuple[float | None, np.ndarray | None]:
+    """Normalize the CLI baseline input.
+
+    Accepts either a single scalar or three XYZ values. Scalar values are
+    treated as a magnitude for the existing scale-based path, while three
+    values are applied directly as the relative-pose translation components.
+    """
+    if raw is None:
+        return None, None
+
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+
+    if isinstance(raw, np.ndarray):
+        values = [float(v) for v in raw.reshape(-1)]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        values = [float(v) for v in raw]
+    else:
+        values = [float(raw)]
+
+    if len(values) == 1:
+        return float(values[0]), None
+    if len(values) == 3:
+        return None, np.asarray(values, dtype=np.float64)
+    raise ValueError("--known-baseline must be a single scalar or three XYZ values")
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -84,6 +118,19 @@ class MultiCameraResult:
     final_cost: float
 
 
+@dataclass
+class MetricInlierFilterStats:
+    total_observations: int
+    kept_observations: int
+    excluded_observations: int
+    invalid_observations: int
+    median_residual: float
+    mad: float
+    threshold: float
+    mad_scale: float
+    spread_source: str = "mad"
+
+
 # ---------------------------------------------------------------------------
 # Pose composition utilities
 # ---------------------------------------------------------------------------
@@ -103,8 +150,40 @@ def compose_poses(pose_a: np.ndarray, pose_b: np.ndarray) -> np.ndarray:
     return np.concatenate([rvec.reshape(3), t]).astype(np.float64)
 
 
+def compose_pose_from_parts(
+    rig_pose: np.ndarray,
+    rel_rvec: np.ndarray,
+    rel_tvec: np.ndarray,
+) -> np.ndarray:
+    """Compose a rig pose with an explicit relative rotation/translation pair."""
+    R_a = rotation_matrix_from_pose(rig_pose)
+    t_a = rig_pose[3:]
+    rel_rvec = np.asarray(rel_rvec, dtype=np.float64).reshape(3)
+    rel_tvec = np.asarray(rel_tvec, dtype=np.float64).reshape(3)
+    R_b, _ = cv2.Rodrigues(rel_rvec)
+    R = R_b @ R_a
+    t = R_b @ t_a + rel_tvec
+    rvec, _ = cv2.Rodrigues(R)
+    return np.concatenate([rvec.reshape(3), t]).astype(np.float64)
+
+
 def identity_pose() -> np.ndarray:
     return np.zeros(6, dtype=np.float64)
+
+
+def remove_relative_pose(abs_pose: np.ndarray, rel_pose: np.ndarray) -> np.ndarray:
+    """Recover the rig world-to-cam0 pose from an absolute camera pose.
+
+    Given abs_pose = compose_poses(rig_pose, rel_pose), solve for rig_pose.
+    """
+    R_abs = rotation_matrix_from_pose(abs_pose)
+    t_abs = abs_pose[3:]
+    R_rel = rotation_matrix_from_pose(rel_pose)
+    t_rel = rel_pose[3:]
+    R_rig = R_rel.T @ R_abs
+    t_rig = R_rel.T @ (t_abs - t_rel)
+    rvec, _ = cv2.Rodrigues(R_rig)
+    return np.concatenate([rvec.reshape(3), t_rig]).astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -194,15 +273,20 @@ def run_sfm(
         })
         colmap_rig.add_ref_sensor(ref_sensor)
 
+        baseline_value, baseline_vector = parse_known_baseline_argument(known_baseline)
         for cam_name in camera_names[1:]:
             sensor = pycolmap.sensor_t({
                 "type": pycolmap.SensorType.CAMERA,
                 "id": camera_id_map[cam_name],
             })
-            baseline_guess = known_baseline if known_baseline is not None else 0.3
+            if baseline_vector is not None:
+                translation = [baseline_vector[0], baseline_vector[1], baseline_vector[2]]
+            else:
+                baseline_guess = baseline_value if baseline_value is not None else 0.3
+                translation = [-baseline_guess, 0.0, 0.0]
             transform = pycolmap.Rigid3d(
                 rotation=pycolmap.Rotation3d([0.0, 0.0, 0.0, 1.0]),
-                translation=[-baseline_guess, 0.0, 0.0],
+                translation=translation,
             )
             colmap_rig.add_sensor(sensor, transform)
         db.write_rig(colmap_rig)
@@ -289,8 +373,9 @@ def run_sfm(
         pose = np.concatenate([rvec.reshape(3), t]).astype(np.float64)
         poses_by_camera[cam_name][stem] = pose
 
-    # Scale
-    if known_baseline is not None:
+    # Scale or fix the baseline, depending on how it was provided.
+    baseline_value, baseline_vector = parse_known_baseline_argument(known_baseline)
+    if baseline_value is not None:
         # Read rig output to determine scale
         rigs_path = recon_output / "rigs.txt"
         if rigs_path.exists():
@@ -303,7 +388,7 @@ def run_sfm(
                     rig_translation = np.array([float(tokens[8]), float(tokens[9]), float(tokens[10])], dtype=np.float64)
                     sfm_baseline = float(np.linalg.norm(rig_translation))
                     if sfm_baseline > 1e-6:
-                        scale = known_baseline / sfm_baseline
+                        scale = baseline_value / sfm_baseline
                         # Scale all translations
                         for cam_name in camera_names:
                             for stem in poses_by_camera[cam_name]:
@@ -377,12 +462,38 @@ def _load_cached_detections(
 def load_targets3d(path: Path) -> Dict[int, np.ndarray]:
     """Load known 3D target positions from a TSV file.
 
-    Expected format (header optional)::
+    Supported formats:
+
+    1. Simple TSV/whitespace with optional header::
 
         target_id  x  y  z
+
+    2. The Metashape export used in this workspace::
+
+        Label Metashape  Label physical  Label actual  X  Y  Z  ...
     """
     points: Dict[int, np.ndarray] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines:
+        return points
+
+    header = lines[0].strip().split("\t")
+    if {"Label actual", "X", "Y", "Z"}.issubset(header):
+        reader = csv.DictReader(lines, delimiter="\t")
+        for row in reader:
+            actual = (row.get("Label actual") or "").strip()
+            if not actual:
+                continue
+            tid = int(actual)
+            points[tid] = np.array(
+                [float(row["X"]), float(row["Y"]), float(row["Z"])],
+                dtype=np.float64,
+            )
+        print(f"loaded {len(points)} known 3D target positions from {path}", flush=True)
+        return points
+
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("target_id"):
             continue
@@ -518,20 +629,22 @@ def initialize_multi_camera_state(
 
     # Compute relative poses
     relative_poses: Dict[str, np.ndarray] = {ref_cam: identity_pose()}
+    baseline_value, baseline_vector = parse_known_baseline_argument(known_baseline)
     scale_factor = 1.0
     for cam_name in camera_names[1:]:
         relative_poses[cam_name] = _compute_relative_pose(
             sfm_poses[ref_cam], sfm_poses[cam_name],
         )
-        # If known baseline is specified, compute a uniform scale factor
-        if known_baseline is not None:
+        if baseline_vector is not None:
+            relative_poses[cam_name][3:] = baseline_vector
+        elif baseline_value is not None:
             rp = relative_poses[cam_name]
             t_norm = float(np.linalg.norm(rp[3:]))
             if t_norm > 1e-9:
-                scale_factor = known_baseline / t_norm
+                scale_factor = baseline_value / t_norm
 
     # Apply scale factor to ALL translations (rig poses + relative poses)
-    if known_baseline is not None and abs(scale_factor - 1.0) > 1e-12:
+    if baseline_value is not None and abs(scale_factor - 1.0) > 1e-12:
         for cam_name in camera_names[1:]:
             relative_poses[cam_name][3:] *= scale_factor
 
@@ -541,12 +654,12 @@ def initialize_multi_camera_state(
               f" (|t|={float(np.linalg.norm(relative_poses[cam_name][3:])):.4f} m)",
               flush=True)
 
-    # Build rig poses from cam-0's SfM poses, keyed by image stem
-    # Scale translations to match the metric baseline if specified
+    # Build rig poses from cam-0's SfM poses, keyed by image stem.
+    # Scale translations to match the metric baseline if specified.
     rig_poses: Dict[str, np.ndarray] = {}
     for stem, pose in sfm_poses[ref_cam].items():
         p = pose.copy()
-        if known_baseline is not None and abs(scale_factor - 1.0) > 1e-12:
+        if baseline_value is not None and abs(scale_factor - 1.0) > 1e-12:
             p[3:] *= scale_factor
         rig_poses[stem] = p
 
@@ -580,6 +693,77 @@ def initialize_multi_camera_state(
                 points[tid] = pt3d.copy()
                 fixed_point_ids.add(tid)
         print(f"  {len(fixed_point_ids)} targets matched from known targets3D file", flush=True)
+
+    if fixed_point_ids:
+        detections_by_cam_stem: Dict[str, Dict[str, ImageDetections]] = {
+            cam_name: {det.image_path.stem: det for det in dets}
+            for cam_name, dets in detections_by_camera.items()
+        }
+        aligned_frames = 0
+        for stem in list(rig_poses.keys()):
+            best_pose: np.ndarray | None = None
+            best_score: tuple[int, float] | None = None
+            for cam_name in camera_names:
+                det = detections_by_cam_stem.get(cam_name, {}).get(stem)
+                if det is None:
+                    continue
+
+                shared_ids = sorted(set(det.detections) & fixed_point_ids)
+                if len(shared_ids) < 6:
+                    continue
+
+                object_points = np.array([points[tid] for tid in shared_ids], dtype=np.float64)
+                image_points = np.array([det.detections[tid] for tid in shared_ids], dtype=np.float64)
+                solved, rotation_vec, translation_vec, inliers = cv2.solvePnPRansac(
+                    object_points,
+                    image_points,
+                    intrinsics_matrix(sfm_intrinsics[cam_name]),
+                    distortion_vector(sfm_intrinsics[cam_name]),
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                    reprojectionError=8.0,
+                    iterationsCount=200,
+                )
+                if not solved or inliers is None or len(inliers) < 6:
+                    continue
+
+                inlier_indices = inliers.reshape(-1)
+                refined, rotation_vec, translation_vec = cv2.solvePnP(
+                    object_points[inlier_indices],
+                    image_points[inlier_indices],
+                    intrinsics_matrix(sfm_intrinsics[cam_name]),
+                    distortion_vector(sfm_intrinsics[cam_name]),
+                    rvec=rotation_vec,
+                    tvec=translation_vec,
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if not refined:
+                    continue
+
+                abs_pose = np.concatenate(
+                    [rotation_vec.reshape(3), translation_vec.reshape(3)]
+                ).astype(np.float64)
+                candidate_rig_pose = abs_pose if cam_name == ref_cam else remove_relative_pose(
+                    abs_pose,
+                    relative_poses[cam_name],
+                )
+
+                projected_errors: List[float] = []
+                for target_id in shared_ids:
+                    pose_for_camera = abs_pose if cam_name != ref_cam else candidate_rig_pose
+                    projected = project_point(sfm_intrinsics[cam_name], pose_for_camera, points[target_id])
+                    projected_errors.append(float(np.linalg.norm(projected - det.detections[target_id])))
+                median_error = float(np.median(projected_errors)) if projected_errors else float("inf")
+                score = (len(inlier_indices), -median_error)
+                if best_score is None or score > best_score:
+                    best_pose = candidate_rig_pose
+                    best_score = score
+
+            if best_pose is not None:
+                rig_poses[stem] = best_pose
+                aligned_frames += 1
+
+        print(f"  re-estimated {aligned_frames} rig poses from known 3D targets", flush=True)
 
     reject_reasons: Dict[str, int] = {"too_few": 0, "homogeneous": 0, "non_finite": 0,
                                       "depth": 0, "reprojection": 0}
@@ -671,6 +855,40 @@ def initialize_multi_camera_state(
     return state
 
 
+def bootstrap_from_known_targets(
+    detections_by_camera: Dict[str, List[ImageDetections]],
+    camera_names: List[str],
+    known_targets3d: Dict[int, np.ndarray],
+    min_shared: int,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, np.ndarray]]]:
+    """Estimate per-camera intrinsics and absolute poses without SfM.
+
+    This uses the known 3D targets directly for each camera, then converts the
+    per-image poses to the same structures returned by ``run_sfm``.
+    """
+    intrinsics_by_camera: Dict[str, np.ndarray] = {}
+    poses_by_camera: Dict[str, Dict[str, np.ndarray]] = {}
+
+    for cam_name in camera_names:
+        cam_detections = detections_by_camera.get(cam_name, [])
+        state, _ = initialize_known_target_state(cam_detections, known_targets3d, min_shared)
+        intrinsics_by_camera[cam_name] = state.intrinsics.copy()
+        detections_by_index = {det.image_index: det for det in cam_detections}
+        poses_by_camera[cam_name] = {
+            detections_by_index[image_index].image_path.stem: pose.copy()
+            for image_index, pose in state.poses.items()
+            if image_index in detections_by_index
+        }
+        print(
+            f"  {cam_name}: bootstrapped {len(poses_by_camera[cam_name])} poses from known 3D targets, "
+            f"fx={state.intrinsics[0]:.1f} fy={state.intrinsics[1]:.1f} "
+            f"cx={state.intrinsics[2]:.1f} cy={state.intrinsics[3]:.1f}",
+            flush=True,
+        )
+
+    return intrinsics_by_camera, poses_by_camera
+
+
 # ---------------------------------------------------------------------------
 # Step 4 — Multi-camera bundle adjustment
 # ---------------------------------------------------------------------------
@@ -678,30 +896,31 @@ def initialize_multi_camera_state(
 class MultiCamReprojectionCost(pyceres.CostFunction):
     """Reprojection residual for a single observation.
 
-    Parameter blocks: [intrinsics(8), rig_pose(6), relative_pose(6), point(3)]
-    The absolute camera pose is: compose(rig_pose, relative_pose).
+    Parameter blocks: [intrinsics(8), rig_pose(6), relative_rvec(3), relative_tvec(3), point(3)]
+    The absolute camera pose is: compose(rig_pose, relative_rvec, relative_tvec).
     """
 
     def __init__(self, observation: np.ndarray):
         super().__init__()
         self.observation = observation.astype(np.float64)
         self.set_num_residuals(2)
-        self.set_parameter_block_sizes([8, 6, 6, 3])
+        self.set_parameter_block_sizes([8, 6, 3, 3, 3])
 
     def Evaluate(self, parameters, residuals, jacobians):
         intrinsics = np.array(parameters[0], dtype=np.float64, copy=True)
         rig_pose = np.array(parameters[1], dtype=np.float64, copy=True)
-        rel_pose = np.array(parameters[2], dtype=np.float64, copy=True)
-        point = np.array(parameters[3], dtype=np.float64, copy=True)
+        rel_rvec = np.array(parameters[2], dtype=np.float64, copy=True)
+        rel_tvec = np.array(parameters[3], dtype=np.float64, copy=True)
+        point = np.array(parameters[4], dtype=np.float64, copy=True)
 
-        abs_pose = compose_poses(rig_pose, rel_pose)
+        abs_pose = compose_pose_from_parts(rig_pose, rel_rvec, rel_tvec)
         prediction = project_point(intrinsics, abs_pose, point)
         residual_vec = prediction - self.observation
         residuals[0] = float(residual_vec[0])
         residuals[1] = float(residual_vec[1])
 
         if jacobians is not None:
-            param_blocks = [intrinsics, rig_pose, rel_pose, point]
+            param_blocks = [intrinsics, rig_pose, rel_rvec, rel_tvec, point]
             for block_idx, block in enumerate(param_blocks):
                 if jacobians[block_idx] is None:
                     continue
@@ -713,10 +932,10 @@ class MultiCamReprojectionCost(pyceres.CostFunction):
                     plus_blocks[block_idx][col] += step
                     minus_blocks[block_idx][col] -= step
 
-                    abs_plus = compose_poses(plus_blocks[1], plus_blocks[2])
-                    abs_minus = compose_poses(minus_blocks[1], minus_blocks[2])
-                    res_plus = project_point(plus_blocks[0], abs_plus, plus_blocks[3]) - self.observation
-                    res_minus = project_point(minus_blocks[0], abs_minus, minus_blocks[3]) - self.observation
+                    abs_plus = compose_pose_from_parts(plus_blocks[1], plus_blocks[2], plus_blocks[3])
+                    abs_minus = compose_pose_from_parts(minus_blocks[1], minus_blocks[2], minus_blocks[3])
+                    res_plus = project_point(plus_blocks[0], abs_plus, plus_blocks[4]) - self.observation
+                    res_minus = project_point(minus_blocks[0], abs_minus, minus_blocks[4]) - self.observation
                     jac[:, col] = (res_plus - res_minus) / (2.0 * step)
 
                 for row in range(2):
@@ -728,7 +947,7 @@ class MultiCamReprojectionCost(pyceres.CostFunction):
 def multi_cam_collect_observations(
     detections_by_camera: Dict[str, List[ImageDetections]],
     state: MultiCameraState,
-    max_reprojection_error: float,
+    max_reprojection_error: float | None,
 ) -> List[Tuple[str, str, int, np.ndarray]]:
     """Collect valid observations across all cameras.
 
@@ -751,29 +970,113 @@ def multi_cam_collect_observations(
                 residual = project_point(intrinsics, abs_pose, pt3d) - pt2d
                 if not np.all(np.isfinite(residual)):
                     continue
-                if np.linalg.norm(residual) <= max_reprojection_error:
+                if max_reprojection_error is None or np.linalg.norm(residual) <= max_reprojection_error:
                     observations.append((cam_name, stem, target_id, pt2d))
     return observations
+
+
+def multi_cam_compute_object_space_residual(
+    state: MultiCameraState,
+    observation: Tuple[str, str, int, np.ndarray],
+) -> float | None:
+    """Return the point-to-ray distance in metres for one observation."""
+    cam_name, stem, target_id, pt2d = observation
+    intrinsics = state.camera_intrinsics[cam_name]
+    rig_pose = state.rig_poses.get(stem)
+    pt3d = state.points.get(target_id)
+    if rig_pose is None or pt3d is None:
+        return None
+
+    abs_pose = compose_poses(rig_pose, state.relative_poses[cam_name])
+    rotation = rotation_matrix_from_pose(abs_pose)
+    camera_center = camera_center_from_pose(abs_pose)
+
+    undistorted = cv2.undistortPoints(
+        np.asarray(pt2d, dtype=np.float64).reshape(1, 1, 2),
+        intrinsics_matrix(intrinsics),
+        distortion_vector(intrinsics),
+    )
+    if undistorted is None:
+        return None
+
+    ray_camera = np.array(
+        [undistorted[0, 0, 0], undistorted[0, 0, 1], 1.0],
+        dtype=np.float64,
+    )
+    ray_camera_norm = np.linalg.norm(ray_camera)
+    if not np.isfinite(ray_camera_norm) or ray_camera_norm <= 1e-12:
+        return None
+    ray_camera /= ray_camera_norm
+
+    ray_world = rotation.T @ ray_camera
+    ray_world_norm = np.linalg.norm(ray_world)
+    if not np.isfinite(ray_world_norm) or ray_world_norm <= 1e-12:
+        return None
+    ray_world /= ray_world_norm
+
+    offset = pt3d - camera_center
+    depth_along_ray = float(np.dot(offset, ray_world))
+    if not np.isfinite(depth_along_ray) or depth_along_ray <= 1e-12:
+        return None
+
+    residual = float(np.linalg.norm(offset - depth_along_ray * ray_world))
+    if not np.isfinite(residual):
+        return None
+    return residual
 
 
 def multi_cam_filter_inlier_observations(
     state: MultiCameraState,
     observations: Sequence[Tuple[str, str, int, np.ndarray]],
-    max_error: float,
-) -> List[Tuple[str, str, int, np.ndarray]]:
-    """Keep only observations below the reprojection error threshold."""
-    inliers: List[Tuple[str, str, int, np.ndarray]] = []
-    for cam_name, stem, target_id, pt2d in observations:
-        intrinsics = state.camera_intrinsics[cam_name]
-        rig_pose = state.rig_poses.get(stem)
-        pt3d = state.points.get(target_id)
-        if rig_pose is None or pt3d is None:
+    mad_scale: float,
+) -> Tuple[List[Tuple[str, str, int, np.ndarray]], MetricInlierFilterStats]:
+    """Keep observations within a MAD threshold on object-space residuals."""
+    residual_pairs: List[Tuple[Tuple[str, str, int, np.ndarray], float]] = []
+    invalid_count = 0
+    for observation in observations:
+        residual = multi_cam_compute_object_space_residual(state, observation)
+        if residual is None:
+            invalid_count += 1
             continue
-        abs_pose = compose_poses(rig_pose, state.relative_poses[cam_name])
-        residual = project_point(intrinsics, abs_pose, pt3d) - pt2d
-        if np.all(np.isfinite(residual)) and np.linalg.norm(residual) <= max_error:
-            inliers.append((cam_name, stem, target_id, pt2d))
-    return inliers
+        residual_pairs.append((observation, residual))
+
+    if not residual_pairs:
+        return [], MetricInlierFilterStats(
+            total_observations=len(observations),
+            kept_observations=0,
+            excluded_observations=len(observations),
+            invalid_observations=invalid_count,
+            median_residual=0.0,
+            mad=0.0,
+            threshold=0.0,
+            mad_scale=mad_scale,
+        )
+
+    residuals = np.array([residual for _, residual in residual_pairs], dtype=np.float64)
+    median = float(np.median(residuals))
+    deviations = np.abs(residuals - median)
+    mad = float(np.median(deviations))
+    spread_source = "mad"
+    if mad <= 1e-12:
+        std_fallback = float(np.std(residuals))
+        if std_fallback > 0.0:
+            mad = std_fallback
+            spread_source = "std"
+
+    threshold = median + mad_scale * mad
+    inliers = [observation for observation, residual in residual_pairs if residual <= threshold]
+    excluded_count = len(observations) - len(inliers)
+    return inliers, MetricInlierFilterStats(
+        total_observations=len(observations),
+        kept_observations=len(inliers),
+        excluded_observations=excluded_count,
+        invalid_observations=invalid_count,
+        median_residual=median,
+        mad=mad,
+        threshold=threshold,
+        mad_scale=mad_scale,
+        spread_source=spread_source,
+    )
 
 
 def multi_cam_compute_reprojection_errors(
@@ -794,6 +1097,18 @@ def multi_cam_compute_reprojection_errors(
     return np.array(errors, dtype=np.float64)
 
 
+def multi_cam_compute_object_space_errors(
+    state: MultiCameraState,
+    observations: Sequence[Tuple[str, str, int, np.ndarray]],
+) -> np.ndarray:
+    errors: List[float] = []
+    for observation in observations:
+        residual = multi_cam_compute_object_space_residual(state, observation)
+        if residual is not None:
+            errors.append(residual)
+    return np.array(errors, dtype=np.float64)
+
+
 def solve_multi_cam_bundle_adjustment(
     state: MultiCameraState,
     observations: Sequence[Tuple[str, str, int, np.ndarray]],
@@ -804,7 +1119,10 @@ def solve_multi_cam_bundle_adjustment(
     robust_loss: str = "huber",
     cauchy_scale: float = 3.0,
     fix_relative_poses: bool = True,
+    fix_relative_pose_translations: bool = False,
+    fix_intrinsics: bool = False,
     fixed_point_ids: Set[int] | None = None,
+    known_baseline: float | None = None,
 ) -> SolverDiagnostics:
     """Joint bundle adjustment over all cameras.
 
@@ -820,6 +1138,8 @@ def solve_multi_cam_bundle_adjustment(
     problem = pyceres.Problem()
     if robust_loss == "cauchy":
         loss = pyceres.CauchyLoss(cauchy_scale)
+    elif robust_loss == "none":
+        loss = pyceres.TrivialLoss()
     else:
         loss = pyceres.HuberLoss(huber_delta)
 
@@ -828,13 +1148,15 @@ def solve_multi_cam_bundle_adjustment(
 
     for cam_name, stem, target_id, pt2d in observations:
         cost = MultiCamReprojectionCost(pt2d)
+        rel_pose = state.relative_poses[cam_name]
         problem.add_residual_block(
             cost,
             loss,
             [
                 state.camera_intrinsics[cam_name],
                 state.rig_poses[stem],
-                state.relative_poses[cam_name],
+                rel_pose[:3],
+                rel_pose[3:],
                 state.points[target_id],
             ],
         )
@@ -847,10 +1169,19 @@ def solve_multi_cam_bundle_adjustment(
         first_frame = sorted(used_rig_poses)[0]
         problem.set_parameter_block_constant(state.rig_poses[first_frame])
 
-    # Fix relative poses (rig constraint)
+    # Keep cam0 as the rig reference to avoid redundancy with rig_poses.
+    ref_cam = state.camera_names[0]
+    problem.set_parameter_block_constant(state.relative_poses[ref_cam][:3])
+    problem.set_parameter_block_constant(state.relative_poses[ref_cam][3:])
+
+    # Optionally fix the remaining relative poses (rig constraint).
     if fix_relative_poses:
-        for cam_name in state.camera_names:
-            problem.set_parameter_block_constant(state.relative_poses[cam_name])
+        for cam_name in state.camera_names[1:]:
+            problem.set_parameter_block_constant(state.relative_poses[cam_name][:3])
+            problem.set_parameter_block_constant(state.relative_poses[cam_name][3:])
+    elif fix_relative_pose_translations:
+        for cam_name in state.camera_names[1:]:
+            problem.set_parameter_block_constant(state.relative_poses[cam_name][3:])
 
     # Fix known 3D points (metric ground truth)
     if fixed_point_ids:
@@ -863,6 +1194,10 @@ def solve_multi_cam_bundle_adjustment(
         intr = state.camera_intrinsics[cam_name]
         # We need at least one observation for this camera in the problem
         if not any(cn == cam_name for cn, _, _, _ in observations):
+            continue
+
+        if fix_intrinsics:
+            problem.set_parameter_block_constant(intr)
             continue
 
         # Determine image size from first observation of this camera
@@ -1005,6 +1340,7 @@ def save_report(
 ) -> Path:
     """Write a human-readable calibration report to report.txt."""
     reproj_errors = multi_cam_compute_reprojection_errors(state, observations)
+    object_errors = multi_cam_compute_object_space_errors(state, observations)
     track_ids = {tid for _, _, tid, _ in observations}
     frame_stems = {stem for _, stem, _, _ in observations}
 
@@ -1027,6 +1363,12 @@ def save_report(
         lines.append(f"  Median: {float(np.median(reproj_errors)):.4f} px")
     lines.append("")
 
+    lines.append("--- Object-space errors ---")
+    if object_errors.size:
+        lines.append(f"  Mean: {float(np.mean(object_errors)):.6f} m")
+        lines.append(f"  RMS:  {float(np.sqrt(np.mean(np.square(object_errors)))):.6f} m")
+    lines.append("")
+
     lines.append("--- Solver ---")
     lines.append(f"  Iterations:   {diagnostics.iterations}")
     lines.append(f"  Initial cost: {diagnostics.initial_cost:.6f}")
@@ -1038,6 +1380,7 @@ def save_report(
         intr = state.camera_intrinsics[cam_name]
         cam_obs = [(cn, s, t, p) for cn, s, t, p in observations if cn == cam_name]
         cam_errors = multi_cam_compute_reprojection_errors(state, cam_obs)
+        cam_object_errors = multi_cam_compute_object_space_errors(state, cam_obs)
 
         # Image resolution from detections
         w, h = 0, 0
@@ -1051,6 +1394,9 @@ def save_report(
         if cam_errors.size:
             lines.append(f"  Mean error: {float(np.mean(cam_errors)):.4f} px")
             lines.append(f"  RMS error:  {float(np.sqrt(np.mean(np.square(cam_errors)))):.4f} px")
+        if cam_object_errors.size:
+            lines.append(f"  Mean object-space error: {float(np.mean(cam_object_errors)):.6f} m")
+            lines.append(f"  RMS object-space error:  {float(np.sqrt(np.mean(np.square(cam_object_errors)))):.6f} m")
         lines.append(f"  Intrinsics (OPENCV):")
         lines.append(f"    fx = {intr[0]:.6f}")
         lines.append(f"    fy = {intr[1]:.6f}")
@@ -1146,10 +1492,12 @@ def parse_combined_args() -> argparse.Namespace:
              "If omitted, auto-detected from image-root.",
     )
     parser.add_argument(
-        "--known-baseline", type=float, default=None,
-        help="Known distance (metres) between cam0 and cam1 for SfM scale.",
+        "--known-baseline", nargs="+", type=float, default=None,
+        help="Known baseline between cam0 and cam1. Provide either one scalar magnitude or three XYZ components.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("combined_output"))
+    parser.add_argument("--skip-sfm", action="store_true",
+                        help="Skip the pycolmap SfM stage and bootstrap poses from known 3D targets instead.")
     parser.add_argument("--force-sfm", action="store_true",
                         help="Re-run SfM even if a cached reconstruction exists.")
     parser.add_argument("--force-detections", action="store_true",
@@ -1163,6 +1511,10 @@ def parse_combined_args() -> argparse.Namespace:
     parser.add_argument("--huber-delta", type=float, default=3.0)
     parser.add_argument("--loss-tolerance", type=float, default=1e-5)
     parser.add_argument("--loss-patience", type=int, default=5)
+    parser.add_argument(
+        "--outlier-mad-scale", type=float, default=3.0,
+        help="Exclude observations after robust BA when object-space residual exceeds median + scale * MAD.",
+    )
     parser.add_argument("--valid-ids-file", type=Path, default=None)
     parser.add_argument("--valid-id-max", type=int, default=None)
     parser.add_argument("--max-id-hamming-distance", type=int, default=0)
@@ -1174,6 +1526,14 @@ def main() -> int:
     image_root: Path = args.image_root.resolve()
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_value, baseline_vector = parse_known_baseline_argument(args.known_baseline)
+    args.known_baseline = baseline_vector if baseline_vector is not None else baseline_value
+
+    known_targets3d = load_targets3d(args.targets3d) if args.targets3d else None
+    if args.skip_sfm and known_targets3d is None:
+        print("ERROR: --skip-sfm currently requires --targets3d", flush=True)
+        return 1
 
     # Auto-detect cameras
     if args.cameras:
@@ -1195,25 +1555,35 @@ def main() -> int:
         valid_ids = parse_valid_ids_file(args.valid_ids_file)
     elif args.valid_id_max is not None:
         valid_ids = set(range(args.valid_id_max + 1))
+    elif known_targets3d is not None:
+        valid_ids = set(known_targets3d.keys())
+
+    sfm_intrinsics: Dict[str, np.ndarray]
+    sfm_poses: Dict[str, Dict[str, np.ndarray]]
 
     # ── Step 1: SfM ──────────────────────────────────────────────
     print("=" * 60, flush=True)
     print("STEP 1: Structure-from-Motion (pycolmap)", flush=True)
     print("=" * 60, flush=True)
-    sfm_dir = output_dir / "sfm"
-    sfm_dir.mkdir(parents=True, exist_ok=True)
+    if args.skip_sfm:
+        print("  skipping SfM; known 3D targets will be used to bootstrap poses after detection", flush=True)
+        sfm_intrinsics = {}
+        sfm_poses = {}
+    else:
+        sfm_dir = output_dir / "sfm"
+        sfm_dir.mkdir(parents=True, exist_ok=True)
 
-    sfm_intrinsics, sfm_poses = run_sfm(
-        image_root, camera_names, sfm_dir,
-        known_baseline=args.known_baseline,
-        force=args.force_sfm,
-    )
-    for cam_name in camera_names:
-        intr = sfm_intrinsics[cam_name]
-        n_poses = len(sfm_poses[cam_name])
-        print(f"  {cam_name}: {n_poses} poses, "
-              f"fx={intr[0]:.1f} fy={intr[1]:.1f} cx={intr[2]:.1f} cy={intr[3]:.1f}",
-              flush=True)
+        sfm_intrinsics, sfm_poses = run_sfm(
+            image_root, camera_names, sfm_dir,
+            known_baseline=args.known_baseline,
+            force=args.force_sfm,
+        )
+        for cam_name in camera_names:
+            intr = sfm_intrinsics[cam_name]
+            n_poses = len(sfm_poses[cam_name])
+            print(f"  {cam_name}: {n_poses} poses, "
+                  f"fx={intr[0]:.1f} fy={intr[1]:.1f} cx={intr[2]:.1f} cy={intr[3]:.1f}",
+                  flush=True)
 
     # ── Step 2: CCT Detection ────────────────────────────────────
     print("=" * 60, flush=True)
@@ -1228,13 +1598,21 @@ def main() -> int:
         force=args.force_detections,
     )
 
+    if args.skip_sfm:
+        print("=" * 60, flush=True)
+        print("STEP 3A: Bootstrap From Known 3D Targets", flush=True)
+        print("=" * 60, flush=True)
+        sfm_intrinsics, sfm_poses = bootstrap_from_known_targets(
+            detections_by_camera,
+            camera_names,
+            known_targets3d,
+            args.min_shared,
+        )
+
     # ── Step 3: Initialize multi-camera state ────────────────────
     print("=" * 60, flush=True)
     print("STEP 3: Initialize multi-camera state", flush=True)
     print("=" * 60, flush=True)
-
-    # Load known 3D targets if provided
-    known_targets3d = load_targets3d(args.targets3d) if args.targets3d else None
 
     state = initialize_multi_camera_state(
         sfm_intrinsics, sfm_poses, detections_by_camera, camera_names,
@@ -1243,6 +1621,15 @@ def main() -> int:
         known_baseline=args.known_baseline,
     )
     fixed_point_ids: Set[int] = getattr(state, '_fixed_point_ids', set())
+    use_known_baseline = args.known_baseline is not None
+    optimize_relative_poses = bool(fixed_point_ids) or use_known_baseline
+    if optimize_relative_poses:
+        if use_known_baseline and not fixed_point_ids:
+            print("  known baseline constraint enabled: optimizing non-reference relative poses", flush=True)
+        else:
+            print("  metric target constraints enabled: optimizing non-reference relative poses", flush=True)
+    else:
+        print("  no metric target constraints: keeping non-reference relative poses fixed", flush=True)
 
     # ── Step 4: Joint bundle adjustment ──────────────────────────
     print("=" * 60, flush=True)
@@ -1250,70 +1637,88 @@ def main() -> int:
     print("=" * 60, flush=True)
 
     observations = multi_cam_collect_observations(
-        detections_by_camera, state, args.max_reprojection_error,
+        detections_by_camera, state, None,
     )
-    print(f"initial observations: {len(observations)}", flush=True)
+    print(f"initial observations (ungated): {len(observations)}", flush=True)
     if len(observations) < 10:
         print("ERROR: not enough observations for bundle adjustment", flush=True)
         return 1
 
-    # First BA (Huber)
+    # First BA (plain LS)
     diagnostics = solve_multi_cam_bundle_adjustment(
         state, observations,
         max_iterations=args.max_iterations,
         huber_delta=args.huber_delta,
         loss_relative_tolerance=args.loss_tolerance,
         loss_patience=args.loss_patience,
+        robust_loss="none",
+        fix_relative_poses=not optimize_relative_poses,
+        fix_relative_pose_translations=args.known_baseline is not None,
         fixed_point_ids=fixed_point_ids,
+        known_baseline=args.known_baseline,
     )
-    print(f"  first BA: {diagnostics.summary}", flush=True)
+    print(f"  first BA (plain LS): {diagnostics.summary}", flush=True)
 
-    # Second pass: re-collect with tighter data
-    observations = multi_cam_collect_observations(
-        detections_by_camera, state, args.max_reprojection_error,
-    )
-    diagnostics = solve_multi_cam_bundle_adjustment(
-        state, observations,
-        max_iterations=args.max_iterations,
-        huber_delta=args.huber_delta,
-        loss_relative_tolerance=args.loss_tolerance,
-        loss_patience=args.loss_patience,
-        fixed_point_ids=fixed_point_ids,
-    )
-    print(f"  second BA: {diagnostics.summary}", flush=True)
-
-    # Robust refinement (Cauchy)
     wide_observations = multi_cam_collect_observations(
         detections_by_camera, state, args.max_reprojection_error * 3.0,
     )
-    if len(wide_observations) >= len(observations):
-        print(f"  robust refinement: {len(wide_observations)} observations "
-              f"(was {len(observations)})", flush=True)
-        diagnostics = solve_multi_cam_bundle_adjustment(
-            state, wide_observations,
-            max_iterations=args.max_iterations,
-            huber_delta=args.huber_delta,
-            loss_relative_tolerance=args.loss_tolerance,
-            loss_patience=args.loss_patience,
-            robust_loss="cauchy",
-            cauchy_scale=3.0,
-            fixed_point_ids=fixed_point_ids,
-        )
-        observations = multi_cam_filter_inlier_observations(
-            state, wide_observations, args.max_reprojection_error,
-        )
-        print(f"  kept {len(observations)}/{len(wide_observations)} inlier observations", flush=True)
+    print(
+        f"  robust BA candidates: {len(wide_observations)} observations "
+        f"(reprojection gate {args.max_reprojection_error * 3.0:.3f} px)",
+        flush=True,
+    )
+    if len(wide_observations) < 10:
+        print("ERROR: not enough observations for robust refinement", flush=True)
+        return 1
 
-        # Final clean BA
-        diagnostics = solve_multi_cam_bundle_adjustment(
-            state, observations,
-            max_iterations=args.max_iterations,
-            huber_delta=args.huber_delta,
-            loss_relative_tolerance=args.loss_tolerance,
-            loss_patience=args.loss_patience,
-            fixed_point_ids=fixed_point_ids,
+    diagnostics = solve_multi_cam_bundle_adjustment(
+        state, wide_observations,
+        max_iterations=args.max_iterations,
+        huber_delta=args.huber_delta,
+        loss_relative_tolerance=args.loss_tolerance,
+        loss_patience=args.loss_patience,
+        robust_loss="cauchy",
+        cauchy_scale=3.0,
+        fix_relative_poses=not optimize_relative_poses,
+        fix_relative_pose_translations=args.known_baseline is not None,
+        fix_intrinsics=True,
+        fixed_point_ids=fixed_point_ids,
+        known_baseline=args.known_baseline,
+    )
+    print(f"  robust BA (Cauchy, intrinsics fixed): {diagnostics.summary}", flush=True)
+
+    observations, filter_stats = multi_cam_filter_inlier_observations(
+        state, wide_observations, args.outlier_mad_scale,
+    )
+    print(
+        f"  metric MAD filter: threshold={filter_stats.threshold:.6f} m "
+        f"(median={filter_stats.median_residual:.6f} m + "
+        f"{filter_stats.mad_scale:.2f} * {filter_stats.spread_source.upper()}={filter_stats.mad:.6f} m); "
+        f"excluded={filter_stats.excluded_observations}/{filter_stats.total_observations} observations",
+        flush=True,
+    )
+    if filter_stats.invalid_observations:
+        print(
+            f"    invalid metric residuals excluded: {filter_stats.invalid_observations}",
+            flush=True,
         )
-        print(f"  final BA: {diagnostics.summary}", flush=True)
+    if len(observations) < 10:
+        print("ERROR: not enough inlier observations after robust filtering", flush=True)
+        return 1
+
+    diagnostics = solve_multi_cam_bundle_adjustment(
+        state, observations,
+        max_iterations=args.max_iterations,
+        huber_delta=args.huber_delta,
+        loss_relative_tolerance=args.loss_tolerance,
+        loss_patience=args.loss_patience,
+        robust_loss="none",
+        fix_relative_poses=not optimize_relative_poses,
+        fix_relative_pose_translations=args.known_baseline is not None,
+        fixed_point_ids=fixed_point_ids,
+        known_baseline=args.known_baseline,
+    )
+    print(f"  final BA (plain LS): {diagnostics.summary}", flush=True)
 
     # ── Results ──────────────────────────────────────────────────
     print("=" * 60, flush=True)

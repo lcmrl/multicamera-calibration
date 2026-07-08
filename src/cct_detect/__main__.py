@@ -59,9 +59,19 @@ def main() -> int:
     parser.add_argument(
         "--output-dir", type=Path, default=Path("cct_output"), help="Output directory"
     )
+    parser.add_argument("--valid-id-min", type=int, default=None,
+                        help="Minimum valid target ID (inclusive).")
+    parser.add_argument("--valid-id-max", type=int, default=None,
+                        help="Maximum valid target ID (inclusive).")
     args = parser.parse_args()
 
-    detector = CCTDetector()
+    valid_id_range = None
+    if args.valid_id_min is not None or args.valid_id_max is not None:
+        lo = args.valid_id_min if args.valid_id_min is not None else 0
+        hi = args.valid_id_max if args.valid_id_max is not None else (1 << 14) - 1
+        valid_id_range = (lo, hi)
+
+    detector = CCTDetector(valid_id_range=valid_id_range)
     result = process_image(args.image, args.output_dir, detector)
     print(json.dumps(result, indent=2))
     return 0

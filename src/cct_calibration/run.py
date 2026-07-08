@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from dataclasses import dataclass
@@ -11,7 +12,10 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pyceres
-import rerun as rr
+try:
+    import rerun as rr
+except ModuleNotFoundError:
+    rr = None
 
 from cct_detect.detector import CCTDetector as _CCTDetector
 
@@ -46,9 +50,12 @@ class CameraCalibrationResult:
     intrinsics: np.ndarray
     mean_reprojection_error: float
     rms_reprojection_error: float
+    mean_object_space_error: float
+    rms_object_space_error: float
     iterations: int
     initial_cost: float
     final_cost: float
+    report_path: Path
     convergence_plot_path: Path
     rerun_recording_path: Path
     scene_data_path: Path
@@ -93,6 +100,45 @@ def resolve_valid_ids(valid_ids_file: Path | None, valid_id_max: int | None) -> 
     return None
 
 
+def load_targets3d(path: Path) -> Dict[int, np.ndarray]:
+    rows = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        raise ValueError(f"No 3D target rows found in {path}")
+
+    header = rows[0].split("\t")
+    if {"Label actual", "X", "Y", "Z"}.issubset(header):
+        targets: Dict[int, np.ndarray] = {}
+        reader = csv.DictReader(rows, delimiter="\t")
+        for row in reader:
+            actual = row.get("Label actual")
+            x_value = row.get("X")
+            y_value = row.get("Y")
+            z_value = row.get("Z")
+            if not actual or x_value is None or y_value is None or z_value is None:
+                continue
+            target_id = int(actual)
+            targets[target_id] = np.array(
+                [float(x_value), float(y_value), float(z_value)],
+                dtype=np.float64,
+            )
+        if not targets:
+            raise ValueError(f"No Metashape-style targets parsed from {path}")
+        return targets
+
+    targets = {}
+    for line in rows:
+        if line.lstrip().startswith("#"):
+            continue
+        parts = line.replace(",", " ").split()
+        if len(parts) < 4:
+            continue
+        target_id = int(parts[0])
+        targets[target_id] = np.array([float(parts[1]), float(parts[2]), float(parts[3])], dtype=np.float64)
+    if not targets:
+        raise ValueError(f"No simple target rows parsed from {path}")
+    return targets
+
+
 def normalize_target_id(raw_id: int, valid_ids: Set[int] | None, max_hamming_distance: int) -> tuple[int | None, bool]:
     if valid_ids is None:
         return raw_id, False
@@ -125,6 +171,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data"),
         help="Root directory that contains the photos_* folders.",
+    )
+    parser.add_argument(
+        "--image-root",
+        type=Path,
+        default=None,
+        help="Optional directory containing image files directly for a single-camera dataset.",
     )
     parser.add_argument(
         "--camera",
@@ -198,6 +250,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum valid target ID. If set, valid IDs are assumed to be 0..N.",
     )
     parser.add_argument(
+        "--targets3d",
+        type=Path,
+        default=None,
+        help="Optional file with known 3D target coordinates. Supports reference.txt Metashape export format.",
+    )
+    parser.add_argument(
         "--max-id-hamming-distance",
         type=int,
         default=0,
@@ -208,10 +266,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run detection only, skip pose initialization and bundle adjustment, and export detections.",
     )
+    parser.add_argument(
+        "--force-detections",
+        action="store_true",
+        help="Re-run CCT detection even if cached target_detections.txt exists.",
+    )
     return parser.parse_args()
 
 
-def iter_camera_images(data_root: Path, camera_name: str) -> List[Path]:
+def iter_camera_images(data_root: Path, camera_name: str, image_root: Path | None = None) -> List[Path]:
+    if image_root is not None:
+        return sorted(
+            path for path in image_root.iterdir()
+            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+        )
+
     image_paths: List[Path] = []
     for folder in sorted(data_root.glob("photos_*")):
         if not folder.is_dir():
@@ -253,6 +322,59 @@ def save_target_detections(
             )
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path
+
+
+def load_cached_detections(
+    cache_path: Path,
+    image_root: Path,
+) -> List[ImageDetections] | None:
+    if not cache_path.exists():
+        return None
+
+    try:
+        lines = cache_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+
+    if not lines or not lines[0].startswith("image_name"):
+        return None
+
+    from collections import OrderedDict
+
+    grouped: Dict[str, Dict[int, np.ndarray]] = OrderedDict()
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        image_name, target_id, x_coord, y_coord = parts[0], parts[1], parts[2], parts[3]
+        grouped.setdefault(image_name, {})[int(target_id)] = np.array(
+            [float(x_coord), float(y_coord)],
+            dtype=np.float64,
+        )
+
+    result: List[ImageDetections] = []
+    width, height = 0, 0
+    for image_index, (image_name, detections) in enumerate(grouped.items()):
+        image_path = image_root / image_name
+        if width == 0 and image_path.exists():
+            image = cv2.imread(str(image_path))
+            if image is not None:
+                height, width = image.shape[:2]
+        result.append(
+            ImageDetections(
+                image_path=image_path,
+                image_index=image_index,
+                width=width,
+                height=height,
+                detections=detections,
+            )
+        )
+
+    print(f"loaded {len(result)} images from cache: {cache_path}", flush=True)
+    return result
 
 
 def filter_images_for_bundle(
@@ -545,6 +667,92 @@ def choose_seed_state(images: Sequence[ImageDetections], min_shared: int) -> Cal
     return best_state
 
 
+def initialize_known_target_state(
+    images: Sequence[ImageDetections],
+    known_targets3d: Dict[int, np.ndarray],
+    min_shared: int,
+) -> tuple[CalibrationState, Set[int]]:
+    if not images:
+        raise RuntimeError("No images passed the detection count filter.")
+
+    width = images[0].width
+    height = images[0].height
+    object_points_list: List[np.ndarray] = []
+    image_points_list: List[np.ndarray] = []
+    image_indices: List[int] = []
+    observed_target_ids: Set[int] = set()
+
+    for image in images:
+        shared_ids = sorted(set(image.detections) & set(known_targets3d))
+        if len(shared_ids) < min_shared:
+            continue
+        object_points_list.append(
+            np.array([known_targets3d[target_id] for target_id in shared_ids], dtype=np.float32).reshape(-1, 1, 3)
+        )
+        image_points_list.append(
+            np.array([image.detections[target_id] for target_id in shared_ids], dtype=np.float32).reshape(-1, 1, 2)
+        )
+        image_indices.append(image.image_index)
+        observed_target_ids.update(shared_ids)
+
+    if len(object_points_list) < 2:
+        raise RuntimeError(
+            "Not enough images with known 3D target correspondences to initialize single-camera calibration."
+        )
+
+    initial_focal = float(max(width, height))
+    initial_camera_matrix = np.array(
+        [
+            [initial_focal, 0.0, width / 2.0],
+            [0.0, initial_focal, height / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    initial_dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+    calibration_rms, camera_matrix, dist_coeffs, rotation_vecs, translation_vecs = cv2.calibrateCamera(
+        object_points_list,
+        image_points_list,
+        (width, height),
+        initial_camera_matrix,
+        initial_dist_coeffs,
+        flags=cv2.CALIB_FIX_K3 | cv2.CALIB_USE_INTRINSIC_GUESS,
+    )
+    dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+
+    intrinsics = np.array(
+        [
+            float(camera_matrix[0, 0]),
+            float(camera_matrix[1, 1]),
+            float(camera_matrix[0, 2]),
+            float(camera_matrix[1, 2]),
+            float(dist_coeffs[0]) if dist_coeffs.size > 0 else 0.0,
+            float(dist_coeffs[1]) if dist_coeffs.size > 1 else 0.0,
+            float(dist_coeffs[2]) if dist_coeffs.size > 2 else 0.0,
+            float(dist_coeffs[3]) if dist_coeffs.size > 3 else 0.0,
+        ],
+        dtype=np.float64,
+    )
+
+    poses = {
+        image_index: np.concatenate([rotation_vec.reshape(3), translation_vec.reshape(3)]).astype(np.float64)
+        for image_index, rotation_vec, translation_vec in zip(image_indices, rotation_vecs, translation_vecs, strict=False)
+    }
+    points = {target_id: known_targets3d[target_id].copy() for target_id in sorted(observed_target_ids)}
+    print(
+        f"initialized from known 3D targets using {len(image_indices)} images and {len(points)} fixed targets "
+        f"(OpenCV RMS {calibration_rms:.4f} px)",
+        flush=True,
+    )
+    return CalibrationState(
+        intrinsics=intrinsics,
+        poses=poses,
+        points=points,
+        seed_image_indices=[],
+        inlier_track_ids=sorted(points),
+    ), set(points)
+
+
 def register_remaining_images(
     images: Sequence[ImageDetections],
     state: CalibrationState,
@@ -662,6 +870,64 @@ def compute_reprojection_errors(
         residual = project_point(state.intrinsics, pose, point_3d) - point_2d
         if np.all(np.isfinite(residual)):
             errors.append(float(np.linalg.norm(residual)))
+    return np.asarray(errors, dtype=np.float64)
+
+
+def compute_object_space_residual(
+    state: CalibrationState,
+    observation: tuple[int, int, np.ndarray],
+) -> float | None:
+    image_index, target_id, point_2d = observation
+    pose = state.poses.get(image_index)
+    point_3d = state.points.get(target_id)
+    if pose is None or point_3d is None:
+        return None
+
+    rotation = rotation_matrix_from_pose(pose)
+    camera_center = camera_center_from_pose(pose)
+    undistorted = cv2.undistortPoints(
+        np.asarray(point_2d, dtype=np.float64).reshape(1, 1, 2),
+        intrinsics_matrix(state.intrinsics),
+        distortion_vector(state.intrinsics),
+    )
+    if undistorted is None:
+        return None
+
+    ray_camera = np.array(
+        [undistorted[0, 0, 0], undistorted[0, 0, 1], 1.0],
+        dtype=np.float64,
+    )
+    ray_camera_norm = np.linalg.norm(ray_camera)
+    if not np.isfinite(ray_camera_norm) or ray_camera_norm <= 1e-12:
+        return None
+    ray_camera /= ray_camera_norm
+
+    ray_world = rotation.T @ ray_camera
+    ray_world_norm = np.linalg.norm(ray_world)
+    if not np.isfinite(ray_world_norm) or ray_world_norm <= 1e-12:
+        return None
+    ray_world /= ray_world_norm
+
+    offset = point_3d - camera_center
+    depth_along_ray = float(np.dot(offset, ray_world))
+    if not np.isfinite(depth_along_ray) or depth_along_ray <= 1e-12:
+        return None
+
+    residual = float(np.linalg.norm(offset - depth_along_ray * ray_world))
+    if not np.isfinite(residual):
+        return None
+    return residual
+
+
+def compute_object_space_errors(
+    state: CalibrationState,
+    observations: Sequence[tuple[int, int, np.ndarray]],
+) -> np.ndarray:
+    errors: List[float] = []
+    for observation in observations:
+        residual = compute_object_space_residual(state, observation)
+        if residual is not None:
+            errors.append(residual)
     return np.asarray(errors, dtype=np.float64)
 
 
@@ -893,6 +1159,70 @@ def save_colmap_output(
     return colmap_dir
 
 
+def save_report(
+    state: CalibrationState,
+    camera_name: str,
+    image_size: tuple[int, int],
+    observations: Sequence[tuple[int, int, np.ndarray]],
+    diagnostics: SolverDiagnostics,
+    output_dir: Path,
+) -> Path:
+    reprojection_errors = compute_reprojection_errors(state, observations)
+    object_space_errors = compute_object_space_errors(state, observations)
+    track_ids = {target_id for _, target_id, _ in observations}
+
+    lines: List[str] = []
+    lines.append("=" * 60)
+    lines.append("MONO CCT CALIBRATION REPORT")
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append(f"Camera:            {camera_name}")
+    lines.append(f"Resolution:        {image_size[0]} x {image_size[1]}")
+    lines.append(f"Used images:       {len(state.poses)}")
+    lines.append(f"Registered images: {len(state.poses)}")
+    lines.append(f"3D targets:        {len(track_ids)}")
+    lines.append(f"Observations:      {len(observations)}")
+    lines.append("")
+
+    lines.append("--- Reprojection errors ---")
+    if reprojection_errors.size:
+        lines.append(f"  Mean: {float(np.mean(reprojection_errors)):.4f} px")
+        lines.append(f"  RMS:  {float(np.sqrt(np.mean(np.square(reprojection_errors)))):.4f} px")
+        lines.append(f"  Max:  {float(np.max(reprojection_errors)):.4f} px")
+        lines.append(f"  Median: {float(np.median(reprojection_errors)):.4f} px")
+    lines.append("")
+
+    lines.append("--- Object-space errors ---")
+    if object_space_errors.size:
+        lines.append(f"  Mean: {float(np.mean(object_space_errors)):.6f} m")
+        lines.append(f"  RMS:  {float(np.sqrt(np.mean(np.square(object_space_errors)))):.6f} m")
+        lines.append(f"  Max:  {float(np.max(object_space_errors)):.6f} m")
+        lines.append(f"  Median: {float(np.median(object_space_errors)):.6f} m")
+    lines.append("")
+
+    lines.append("--- Solver ---")
+    lines.append(f"  Iterations:   {diagnostics.iterations}")
+    lines.append(f"  Initial cost: {diagnostics.initial_cost:.6f}")
+    lines.append(f"  Final cost:   {diagnostics.final_cost:.6f}")
+    lines.append(f"  {diagnostics.summary}")
+    lines.append("")
+
+    intrinsics = state.intrinsics
+    lines.append("--- Intrinsics (OPENCV) ---")
+    lines.append(f"  fx = {intrinsics[0]:.6f}")
+    lines.append(f"  fy = {intrinsics[1]:.6f}")
+    lines.append(f"  cx = {intrinsics[2]:.6f}")
+    lines.append(f"  cy = {intrinsics[3]:.6f}")
+    lines.append(f"  k1 = {intrinsics[4]:.6f}")
+    lines.append(f"  k2 = {intrinsics[5]:.6f}")
+    lines.append(f"  p1 = {intrinsics[6]:.6f}")
+    lines.append(f"  p2 = {intrinsics[7]:.6f}")
+
+    report_path = output_dir / f"{camera_name}_report.txt"
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
 def rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
     trace = float(np.trace(rotation))
     if trace > 0.0:
@@ -933,6 +1263,10 @@ def write_rerun_visualization(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     recording_path = output_dir / f"{camera_name}.rrd"
+
+    if rr is None:
+        recording_path.write_text("rerun is not installed in this environment\n", encoding="utf-8")
+        return recording_path
 
     pose_indices, camera_centers, camera_axes, track_ids, target_points = align_scene(state)
     recording = rr.init(f"calibration_{camera_name}", spawn=False)
@@ -1068,6 +1402,7 @@ def solve_bundle_adjustment(
     loss_patience: int,
     robust_loss: str = "huber",
     cauchy_scale: float = 3.0,
+    fixed_point_ids: Set[int] | None = None,
 ) -> SolverDiagnostics:
     problem = pyceres.Problem()
     if robust_loss == "cauchy":
@@ -1075,6 +1410,7 @@ def solve_bundle_adjustment(
     else:
         loss = pyceres.HuberLoss(huber_delta)
     manifolds: List[pyceres.Manifold] = []
+    used_points: Set[int] = set()
 
     for image_index, target_id, point_2d in observations:
         cost = ReprojectionCost(point_2d)
@@ -1083,14 +1419,20 @@ def solve_bundle_adjustment(
             loss,
             [state.intrinsics, state.poses[image_index], state.points[target_id]],
         )
+        used_points.add(target_id)
 
-    if state.seed_image_indices:
-        problem.set_parameter_block_constant(state.poses[state.seed_image_indices[0]])
-    if len(state.seed_image_indices) > 1:
-        second_seed_pose = state.poses[state.seed_image_indices[1]]
-        translation_fixed_manifold = pyceres.SubsetManifold(6, [3, 4, 5])
-        manifolds.append(translation_fixed_manifold)
-        problem.set_manifold(second_seed_pose, translation_fixed_manifold)
+    if fixed_point_ids:
+        for target_id in fixed_point_ids:
+            if target_id in used_points:
+                problem.set_parameter_block_constant(state.points[target_id])
+    else:
+        if state.seed_image_indices:
+            problem.set_parameter_block_constant(state.poses[state.seed_image_indices[0]])
+        if len(state.seed_image_indices) > 1:
+            second_seed_pose = state.poses[state.seed_image_indices[1]]
+            translation_fixed_manifold = pyceres.SubsetManifold(6, [3, 4, 5])
+            manifolds.append(translation_fixed_manifold)
+            problem.set_manifold(second_seed_pose, translation_fixed_manifold)
 
     width = images[0].width
     height = images[0].height
@@ -1133,6 +1475,7 @@ def solve_bundle_adjustment(
 def calibrate_camera(
     camera_name: str,
     data_root: Path,
+    image_root: Path | None,
     min_detections: int,
     min_shared: int,
     max_reprojection_error: float,
@@ -1142,27 +1485,38 @@ def calibrate_camera(
     loss_patience: int,
     output_dir: Path,
     show_3d: bool,
+    known_targets3d: Dict[int, np.ndarray] | None,
     valid_ids: Set[int] | None,
     max_id_hamming_distance: int,
+    force_detections: bool,
 ) -> CameraCalibrationResult:
-    image_paths = iter_camera_images(data_root, camera_name)
+    image_paths = iter_camera_images(data_root, camera_name, image_root)
     if not image_paths:
         raise RuntimeError(f"No images found for {camera_name} under {data_root}")
 
     print(f"collecting detections for {camera_name} from {len(image_paths)} images", flush=True)
     detections_dir_path = output_dir / camera_name / "annotated_detections"
-    images = load_image_detections(
-        image_paths,
-        detections_output_dir=detections_dir_path,
-        valid_ids=valid_ids,
-        max_id_hamming_distance=max_id_hamming_distance,
-    )
-    target_detections_path = save_target_detections(images, camera_name, output_dir)
+    cache_path = output_dir / camera_name / "target_detections.txt"
+    images = None if force_detections else load_cached_detections(cache_path, image_paths[0].parent)
+    if images is None:
+        images = load_image_detections(
+            image_paths,
+            detections_output_dir=detections_dir_path,
+            valid_ids=valid_ids,
+            max_id_hamming_distance=max_id_hamming_distance,
+        )
+        target_detections_path = save_target_detections(images, camera_name, output_dir)
+    else:
+        target_detections_path = cache_path
     bundle_images = filter_images_for_bundle(images, min_detections)
     if len(bundle_images) < 2:
         raise RuntimeError(f"Not enough images with more than {min_detections} detections for {camera_name}")
 
-    state = choose_seed_state(bundle_images, min_shared)
+    fixed_point_ids: Set[int] | None = None
+    if known_targets3d is not None:
+        state, fixed_point_ids = initialize_known_target_state(bundle_images, known_targets3d, min_shared)
+    else:
+        state = choose_seed_state(bundle_images, min_shared)
     register_remaining_images(bundle_images, state, min_shared)
 
     observations = collect_observations(bundle_images, state, max_reprojection_error)
@@ -1178,6 +1532,7 @@ def calibrate_camera(
         huber_delta,
         loss_relative_tolerance,
         loss_patience,
+        fixed_point_ids=fixed_point_ids,
     )
 
     # Second pass: try to register images that failed on noisy initial geometry.
@@ -1199,6 +1554,7 @@ def calibrate_camera(
             huber_delta,
             loss_relative_tolerance,
             loss_patience,
+            fixed_point_ids=fixed_point_ids,
         )
     # --- Robust refinement pass ---
     # Re-collect all possible observations (generous threshold) and run BA with
@@ -1220,6 +1576,7 @@ def calibrate_camera(
             loss_patience,
             robust_loss="cauchy",
             cauchy_scale=3.0,
+            fixed_point_ids=fixed_point_ids,
         )
         # Discard observations that remain outliers after robust optimisation
         observations = _filter_inlier_observations(state, all_observations, max_reprojection_error)
@@ -1236,12 +1593,15 @@ def calibrate_camera(
             huber_delta,
             loss_relative_tolerance,
             loss_patience,
+            fixed_point_ids=fixed_point_ids,
         )
 
     reprojection_errors = compute_reprojection_errors(state, observations)
     if reprojection_errors.size == 0:
         raise RuntimeError(f"No reprojection errors available after optimization for {camera_name}")
+    object_space_errors = compute_object_space_errors(state, observations)
 
+    report_path = save_report(state, camera_name, (bundle_images[0].width, bundle_images[0].height), observations, diagnostics, output_dir)
     convergence_plot_path = save_convergence_plot(camera_name, diagnostics.cost_history, output_dir)
     scene_data_path = save_scene_data(state, camera_name, output_dir)
     rerun_recording_path = write_rerun_visualization(state, camera_name, (bundle_images[0].width, bundle_images[0].height), output_dir, show_3d)
@@ -1259,9 +1619,12 @@ def calibrate_camera(
         intrinsics=state.intrinsics.copy(),
         mean_reprojection_error=float(np.mean(reprojection_errors)),
         rms_reprojection_error=float(np.sqrt(np.mean(np.square(reprojection_errors)))),
+        mean_object_space_error=float(np.mean(object_space_errors)) if object_space_errors.size else 0.0,
+        rms_object_space_error=float(np.sqrt(np.mean(np.square(object_space_errors)))) if object_space_errors.size else 0.0,
         iterations=diagnostics.iterations,
         initial_cost=diagnostics.initial_cost,
         final_cost=diagnostics.final_cost,
+        report_path=report_path,
         convergence_plot_path=convergence_plot_path,
         rerun_recording_path=rerun_recording_path,
         scene_data_path=scene_data_path,
@@ -1276,24 +1639,31 @@ def calibrate_camera(
 def detect_camera(
     camera_name: str,
     data_root: Path,
+    image_root: Path | None,
     min_detections: int,
     output_dir: Path,
     valid_ids: Set[int] | None,
     max_id_hamming_distance: int,
+    force_detections: bool,
 ) -> tuple[DetectionOnlyResult, List[ImageDetections]]:
-    image_paths = iter_camera_images(data_root, camera_name)
+    image_paths = iter_camera_images(data_root, camera_name, image_root)
     if not image_paths:
         raise RuntimeError(f"No images found for {camera_name} under {data_root}")
 
     print(f"collecting detections for {camera_name} from {len(image_paths)} images", flush=True)
     detections_dir_path = output_dir / camera_name / "annotated_detections"
-    images = load_image_detections(
-        image_paths,
-        detections_output_dir=detections_dir_path,
-        valid_ids=valid_ids,
-        max_id_hamming_distance=max_id_hamming_distance,
-    )
-    target_detections_path = save_target_detections(images, camera_name, output_dir)
+    cache_path = output_dir / camera_name / "target_detections.txt"
+    images = None if force_detections else load_cached_detections(cache_path, image_paths[0].parent)
+    if images is None:
+        images = load_image_detections(
+            image_paths,
+            detections_output_dir=detections_dir_path,
+            valid_ids=valid_ids,
+            max_id_hamming_distance=max_id_hamming_distance,
+        )
+        target_detections_path = save_target_detections(images, camera_name, output_dir)
+    else:
+        target_detections_path = cache_path
     return DetectionOnlyResult(
         camera_name=camera_name,
         total_images=len(image_paths),
@@ -1318,6 +1688,9 @@ def format_result(result: CameraCalibrationResult) -> dict:
         "final_cost": result.final_cost,
         "avg_reprojection_error_px": result.mean_reprojection_error,
         "rms_reprojection_error_px": result.rms_reprojection_error,
+        "avg_object_space_error_m": result.mean_object_space_error,
+        "rms_object_space_error_m": result.rms_object_space_error,
+        "report": str(result.report_path),
         "convergence_plot": str(result.convergence_plot_path),
         "rerun_recording": str(result.rerun_recording_path),
         "scene_data": str(result.scene_data_path),
@@ -1351,8 +1724,18 @@ def format_detection_result(result: DetectionOnlyResult) -> dict:
 
 def main() -> int:
     args = parse_args()
+    known_targets3d = load_targets3d(args.targets3d) if args.targets3d is not None else None
     valid_ids = resolve_valid_ids(args.valid_ids_file, args.valid_id_max)
-    cameras = args.cameras or ["camera_0", "camera_1"]
+    if valid_ids is None and known_targets3d is not None:
+        valid_ids = set(known_targets3d.keys())
+
+    image_root = args.image_root.resolve() if args.image_root is not None else None
+    if image_root is not None:
+        if args.cameras and len(args.cameras) != 1:
+            raise RuntimeError("--image-root supports exactly one camera name")
+        cameras = args.cameras or [image_root.name]
+    else:
+        cameras = args.cameras or ["camera_0", "camera_1"]
 
     if args.detect_only:
         detection_results: List[dict] = []
@@ -1361,10 +1744,12 @@ def main() -> int:
             result, images = detect_camera(
                 camera_name=camera_name,
                 data_root=args.data_root,
+                image_root=image_root,
                 min_detections=args.min_detections,
                 output_dir=args.output_dir,
                 valid_ids=valid_ids,
                 max_id_hamming_distance=args.max_id_hamming_distance,
+                force_detections=args.force_detections,
             )
             result_dict = format_detection_result(result)
             detection_results.append(result_dict)
@@ -1388,6 +1773,7 @@ def main() -> int:
         result = calibrate_camera(
             camera_name=camera_name,
             data_root=args.data_root,
+            image_root=image_root,
             min_detections=args.min_detections,
             min_shared=args.min_shared,
             max_reprojection_error=args.max_reprojection_error,
@@ -1397,8 +1783,10 @@ def main() -> int:
             loss_patience=args.loss_patience,
             output_dir=args.output_dir,
             show_3d=args.show_3d,
+            known_targets3d=known_targets3d,
             valid_ids=valid_ids,
             max_id_hamming_distance=args.max_id_hamming_distance,
+            force_detections=args.force_detections,
         )
         result_dict = format_result(result)
         results.append(result_dict)
