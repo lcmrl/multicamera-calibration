@@ -144,13 +144,15 @@ This runs detection only and exports the detections without performing pose init
 - `--image-root`: root folder with images. For multi-camera rigs this should contain camera subfolders such as `cam0/` and `cam1/`. For mono calibration it can be a folder of image files directly.
 - `--output-dir`: destination folder for reports, summaries, caches, and plots.
 - `--targets3d`: path to a known 3D target reference file. Use this when you want a metric calibration.
+- `--checkpoints [RATIO]`: optionally withhold complete target IDs from target-based initialization and every calibration bundle for final independent accuracy checks. With no ratio it uses `0.2`; `--checkpoints 0` preserves the ordinary workflow. Checkpoint runs restore original detector coordinates from the cache so refined centers from an earlier target partition cannot leak into the experiment; only legacy or incomplete caches require a one-time redetection.
+- `--checkpoint-seed`: reproducible integer seed for checkpoint selection (default `42`). The selected IDs and realised ratio are written to `checkpoint_split.json`.
 - `--force-detections`: ignore existing detection cache files and rerun target detection.
 
 ### Multi-camera flags
 
 - `--camera`: choose specific camera folders. Repeat it to select multiple cameras explicitly, for example `--camera cam0 --camera cam1`.
-- `--known-baseline`: provide a known inter-camera distance in meters to help initialize the SfM scale.
-- `--skip-sfm`: bypass the SfM stage and bootstrap from known 3D targets instead. Requires `--targets3d`.
+- `--known-baseline`: provide either the cam0–cam1 baseline magnitude (one value, metres) or its XYZ translation vector (three values); it initializes the SfM scale and applies the corresponding rig constraint.
+- `--skip-sfm`: bypass the SfM stage and bootstrap from known 3D targets instead. Requires `--targets3d`. Intrinsics are initialized from a bounded, geometry-diverse subset (up to 24 frames, selected from at most 96 candidates); fixed-intrinsic PnP then registers the remaining retained frames before the full bundle adjustment.
 - `--force-sfm`: ignore any existing SfM reconstruction cache and recompute it.
 - `--min-detections`: minimum number of detections required for an image to be kept.
 - `--min-shared`: minimum number of shared target observations required for initialization.
@@ -181,6 +183,20 @@ The pipeline reuses previous intermediate results where possible.
 
 Use `--force-detections` or `--force-sfm` when you want to rebuild those intermediate results from scratch.
 
+## PDF calibration report
+
+The multi-camera pipeline automatically generates `calibration_report.pdf` in the output directory. The report is aimed at photogrammetry experts and contains:
+
+- **Summary** — residual statistics (mean/RMS/median/percentiles for pixel and object-space residuals), per-camera overview, and solution redundancy (unknowns, degrees of freedom, redundancy ratio, outlier-filter accounting).
+- **Residual analysis** — signed u/v and radial/tangential statistics, standardized residuals, local redundancy, per-frame/per-target diagnostics, outlier selection, error histograms/CDFs, and bundle-adjustment convergence.
+- **Parameter determinability** — initial/final/status tables, marginal standard deviations and 95% intervals, the full correlation heatmap, a condition indicator, and the a-posteriori variance factor. Supplying `--observation-sigma-px` also enables a chi-square consistency test.
+- **Projection uncertainty** — intrinsic projection-uncertainty maps and joint calibration/triangulation uncertainty versus working distance.
+- **Per-camera deep dive** — binned signed-vector fields, separate u/v/radial/tangential heatmaps, error-vs-radius trends, distortion profiles, and density-aware FoV coverage.
+- **Network strength** — pose, range, image-scale and field-angle distributions; camera-target connectivity; local reliability; and explicit weak-frame/weak-target tables. Surface-incidence angles are reported as unavailable unless target normals become part of the input model.
+- **Rig quality** (multi-camera only) — component-wise extrinsic uncertainty, shared support, Sampson error, rectified vertical disparity, stereo intersection angle, baseline/depth ratio, internal triangulation discrepancies, rig geometry and scene layout.
+
+Pass `--no-pdf-report` to skip PDF generation. Use `--observation-sigma-px VALUE` to state the a-priori one-sigma precision of each image coordinate. The reporting code lives in `src/cct_calibration/reporting/`.
+
 ## Output files
 
 ### Multi-camera outputs
@@ -189,6 +205,7 @@ Typical outputs include:
 
 - `combined_summary.json`
 - `report.txt`
+- `calibration_report.pdf` — rich PDF report (see below)
 - `camchain.yaml`
 - `combined_convergence.png`
 - `sfm/`

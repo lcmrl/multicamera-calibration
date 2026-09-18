@@ -11,10 +11,14 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import gc
 import json
+import math
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Sequence, Set, Tuple
@@ -25,6 +29,7 @@ import numpy as np
 import pyceres
 import pycolmap
 import yaml
+from cct_detect.detector import CCTDetector
 
 from cct_calibration.run import (
     CalibrationState,
@@ -40,15 +45,18 @@ from cct_calibration.run import (
     filter_images_for_bundle,
     initialize_known_target_state,
     intrinsics_matrix,
+    load_refinement_cache,
     normalize_target_id,
     project_point,
     rotation_matrix_from_pose,
     rotation_matrix_to_quaternion,
     save_convergence_plot,
+    save_refinement_cache,
     save_target_detections,
     triangulate_two_views,
     _filter_inlier_observations,
 )
+from cct_detect.refinement import prepare_refinement_image, refine_projected_center
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,9 +83,14 @@ def parse_known_baseline_argument(raw: object) -> tuple[float | None, np.ndarray
         values = [float(raw)]
 
     if len(values) == 1:
+        if not np.isfinite(values[0]) or values[0] <= 0:
+            raise ValueError("--known-baseline scalar must be finite and positive")
         return float(values[0]), None
     if len(values) == 3:
-        return None, np.asarray(values, dtype=np.float64)
+        vector = np.asarray(values, dtype=np.float64)
+        if not np.all(np.isfinite(vector)) or float(np.linalg.norm(vector)) <= 1e-12:
+            raise ValueError("--known-baseline vector must be finite and non-zero")
+        return None, vector
     raise ValueError("--known-baseline must be a single scalar or three XYZ values")
 
 
@@ -129,6 +142,45 @@ class MetricInlierFilterStats:
     threshold: float
     mad_scale: float
     spread_source: str = "mad"
+
+
+@dataclass
+class AdjustmentDiagnostics:
+    """Linearised quality information for the final bundle adjustment.
+
+    Covariances are marginal covariances: frame poses and free object points
+    remain in the normal equations as nuisance parameters.  Fixed parameters
+    have NaN covariance entries and are identified by ``parameter_status``.
+    """
+
+    parameter_names: List[str]
+    parameter_initial: np.ndarray
+    parameter_final: np.ndarray
+    parameter_status: List[str]
+    covariance: np.ndarray
+    correlation: np.ndarray
+    sigma0_px: float
+    dof: int
+    variance_factor: float
+    observation_sigma_px: float | None
+    chi_square_statistic: float | None
+    chi_square_p_value: float | None
+    chi_square_consistent_95: bool | None
+    condition_number: float
+    leverage_uv: np.ndarray
+    local_redundancy_uv: np.ndarray
+    standardized_residuals_uv: np.ndarray
+    covariance_method: str
+    warnings: List[str]
+    jacobian_rows: int = 0
+    jacobian_columns: int = 0
+    numerical_rank: int | None = None
+    rank_tolerance: float | None = None
+    rank_verified: bool = False
+    nullity: int | None = None
+    singular_values: np.ndarray | None = None
+    weakest_singular_values: np.ndarray | None = None
+    exact_left_vectors: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -274,15 +326,18 @@ def run_sfm(
         colmap_rig.add_ref_sensor(ref_sensor)
 
         baseline_value, baseline_vector = parse_known_baseline_argument(known_baseline)
-        for cam_name in camera_names[1:]:
+        for index, cam_name in enumerate(camera_names[1:], start=1):
             sensor = pycolmap.sensor_t({
                 "type": pycolmap.SensorType.CAMERA,
                 "id": camera_id_map[cam_name],
             })
-            if baseline_vector is not None:
+            if baseline_vector is not None and index == 1:
                 translation = [baseline_vector[0], baseline_vector[1], baseline_vector[2]]
             else:
-                baseline_guess = baseline_value if baseline_value is not None else 0.3
+                # A supplied baseline is defined only for cam0-cam1.  Other
+                # sensors retain an ordinary initialization and are not
+                # silently assigned the same translation.
+                baseline_guess = baseline_value if (baseline_value is not None and index == 1) else 0.3
                 translation = [-baseline_guess, 0.0, 0.0]
             transform = pycolmap.Rigid3d(
                 rotation=pycolmap.Rotation3d([0.0, 0.0, 0.0, 1.0]),
@@ -322,9 +377,14 @@ def run_sfm(
         if recon_output.exists():
             shutil.rmtree(str(recon_output))
 
-        # Use fast extraction settings: fewer features, skip upsampled octave
+        # Use bounded-memory extraction settings.  Full-resolution extraction
+        # with the default 8192 SIFT features per image can leave incremental
+        # mapping with several gigabytes of feature/match allocations on a
+        # large rig sequence.
         extraction_opts = pycolmap.FeatureExtractionOptions()
-        extraction_opts.sift.max_num_features = 4096
+        extraction_opts.max_image_size = 3000
+        extraction_opts.num_threads = 1
+        extraction_opts.sift.max_num_features = 2048
         extraction_opts.sift.first_octave = 0
 
         pycolmap.extract_features(
@@ -337,9 +397,40 @@ def run_sfm(
         seq_opts.overlap = 10
         seq_opts.quadratic_overlap = False
         seq_opts.loop_detection = False
+        seq_opts.num_threads = 1
         pycolmap.match_sequential(db_path, pairing_options=seq_opts)
 
-        maps = pycolmap.incremental_mapping(db_path, colmap_image_root, recon_output)
+        # Keep one model and one worker: disconnected-model bookkeeping and
+        # per-thread BA workspaces are a common source of ``bad allocation``
+        # failures for long image sequences.  The calibration BA below still
+        # performs the full high-precision solve after this initialization.
+        mapping_opts = pycolmap.IncrementalPipelineOptions()
+        mapping_opts.multiple_models = False
+        mapping_opts.max_num_models = 1
+        mapping_opts.extract_colors = False
+        mapping_opts.num_threads = 1
+        mapping_opts.mapper.num_threads = 1
+        mapping_opts.mapper.ba_local_num_images = 4
+        mapping_opts.init_num_trials = 80
+        mapping_opts.ba_use_gpu = False
+        try:
+            maps = pycolmap.incremental_mapping(
+                db_path, colmap_image_root, recon_output, options=mapping_opts,
+            )
+        except MemoryError as exc:
+            # Release Python-side handles before surfacing a useful recovery
+            # instruction.  The caller can rerun with --skip-sfm and known
+            # targets when the image graph itself cannot fit in memory.  Do
+            # not leave a partial reconstruction that a later non-forced run
+            # might mistake for a valid cache.
+            gc.collect()
+            if recon_output.exists():
+                shutil.rmtree(str(recon_output), ignore_errors=True)
+            raise RuntimeError(
+                "SfM incremental mapping ran out of memory even with bounded "
+                "single-thread settings; reduce the image set/resolution or "
+                "use --skip-sfm with --targets3d."
+            ) from exc
 
         if not maps:
             raise RuntimeError("SfM reconstruction failed — no maps produced.")
@@ -372,28 +463,6 @@ def run_sfm(
         rvec, _ = cv2.Rodrigues(R)
         pose = np.concatenate([rvec.reshape(3), t]).astype(np.float64)
         poses_by_camera[cam_name][stem] = pose
-
-    # Scale or fix the baseline, depending on how it was provided.
-    baseline_value, baseline_vector = parse_known_baseline_argument(known_baseline)
-    if baseline_value is not None:
-        # Read rig output to determine scale
-        rigs_path = recon_output / "rigs.txt"
-        if rigs_path.exists():
-            for line in rigs_path.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                tokens = line.split()
-                if len(tokens) >= 11:
-                    rig_translation = np.array([float(tokens[8]), float(tokens[9]), float(tokens[10])], dtype=np.float64)
-                    sfm_baseline = float(np.linalg.norm(rig_translation))
-                    if sfm_baseline > 1e-6:
-                        scale = baseline_value / sfm_baseline
-                        # Scale all translations
-                        for cam_name in camera_names:
-                            for stem in poses_by_camera[cam_name]:
-                                poses_by_camera[cam_name][stem][3:] *= scale
-                    break
 
     print(f"SfM: reconstructed {sum(len(v) for v in poses_by_camera.values())} images "
           f"across {len(camera_names)} cameras", flush=True)
@@ -455,7 +524,12 @@ def _load_cached_detections(
             detections=dets,
         ))
 
-    print(f"  loaded {len(result)} images from cache: {cache_path}", flush=True)
+    evidence_count = load_refinement_cache(result, cache_path.parent)
+    print(
+        f"  loaded {len(result)} images from cache: {cache_path} "
+        f"({evidence_count} detections ready for centre refinement)",
+        flush=True,
+    )
     return result
 
 
@@ -514,6 +588,7 @@ def detect_all_cameras(
     max_id_hamming_distance: int = 0,
     min_detections: int = 5,
     force: bool = False,
+    initial_intrinsics: Dict[str, np.ndarray] | None = None,
 ) -> Dict[str, List[ImageDetections]]:
     """Run CCT detection on all cameras.
 
@@ -544,6 +619,7 @@ def detect_all_cameras(
                 detections_dir,
                 valid_ids,
                 max_id_hamming_distance,
+                initial_intrinsics=initial_intrinsics.get(cam_name) if initial_intrinsics else None,
             )
             # Save detections to cache
             save_target_detections(raw, cam_name, output_dir)
@@ -558,6 +634,16 @@ def detect_all_cameras(
                     width=det.width,
                     height=det.height,
                     detections=det.detections,
+                    raw_detections={
+                        target_id: point.copy()
+                        for target_id, point in det.raw_detections.items()
+                    },
+                    refinement_ellipses=dict(det.refinement_ellipses),
+                    refinement_status={
+                        target_id: dict(status)
+                        for target_id, status in det.refinement_status.items()
+                    },
+                    raw_cache_verified=det.raw_cache_verified,
                 ))
             global_index += 1
 
@@ -565,6 +651,305 @@ def detect_all_cameras(
         print(f"  {cam_name}: {len(cam_detections)} images with >= {min_detections} detections", flush=True)
 
     return all_detections
+
+
+def refine_detected_centers_after_calibration(
+    detections_by_camera: Dict[str, List[ImageDetections]],
+    camera_intrinsics: Dict[str, np.ndarray],
+    valid_ids: Set[int] | None = None,
+    max_id_hamming_distance: int = 0,
+) -> dict[str, int]:
+    """Refine existing verified observations without full-frame redetection.
+
+    Cached verified ellipses go directly to the calibrated conic estimator.
+    Legacy ID/x/y caches recover missing ellipses inside bounded local ROIs,
+    using the unchanged strict ring/code detector and requiring the same ID.
+    Refinement can never add, remove, or relabel an observation.
+    """
+
+    def recover_verified_ellipse(
+        image: np.ndarray,
+        expected_id: int,
+        seed: np.ndarray,
+        detector: CCTDetector,
+    ) -> tuple | None:
+        height, width = image.shape[:2]
+        for half_size in (64, 128, 256, 384):
+            center_x, center_y = float(seed[0]), float(seed[1])
+            left = max(0, int(np.floor(center_x - half_size)))
+            top = max(0, int(np.floor(center_y - half_size)))
+            right = min(width, int(np.ceil(center_x + half_size)))
+            bottom = min(height, int(np.ceil(center_y + half_size)))
+            if right - left < 32 or bottom - top < 32:
+                continue
+            candidates = detector.detect(image[top:bottom, left:right])
+            associated: list[tuple] = []
+            for candidate in candidates:
+                normalized_id, _ = normalize_target_id(
+                    int(candidate.target_id), valid_ids, max_id_hamming_distance,
+                )
+                if normalized_id != expected_id:
+                    continue
+                (local_x, local_y), axes, angle = candidate.ellipse
+                global_center = np.array([local_x + left, local_y + top], dtype=np.float64)
+                radius = max(axes) / 2.0
+                if np.linalg.norm(global_center - seed) > max(2.0, 0.4 * radius):
+                    continue
+                # The strict verifier needs the complete three-ring target.
+                # Do not cache evidence whose outer ring touched the ROI edge.
+                margin = 3.2 * radius + 2.0
+                if min(local_x, local_y, right - left - local_x, bottom - top - local_y) < margin:
+                    continue
+                associated.append((
+                    (float(global_center[0]), float(global_center[1])),
+                    (float(axes[0]), float(axes[1])),
+                    float(angle),
+                ))
+            if len(associated) == 1:
+                return associated[0]
+            if len(associated) > 1:
+                return None
+        return None
+
+    def cached_model_is_current(
+        images: Sequence[ImageDetections], current: np.ndarray,
+    ) -> tuple[bool, float, float]:
+        old_models: list[np.ndarray] = []
+        sample_points: list[np.ndarray] = []
+        for image_record in images:
+            for target_id, point in image_record.detections.items():
+                status = image_record.refinement_status.get(target_id, {})
+                # Local ellipse recovery depends on the immutable image and
+                # observation, not the camera model. Do not repeat a bounded
+                # search that already exhausted all permitted ROIs.
+                if (
+                    target_id not in image_record.refinement_ellipses
+                    and not status.get("recovery_exhausted", False)
+                ):
+                    return False, float("inf"), float("inf")
+                values = status.get("intrinsics")
+                if values is None:
+                    return False, float("inf"), float("inf")
+                model = np.asarray(values, dtype=np.float64)
+                if model.shape != (8,) or not np.all(np.isfinite(model)):
+                    return False, float("inf"), float("inf")
+                old_models.append(model)
+                sample_points.append(np.asarray(point, dtype=np.float64))
+        if not old_models or not sample_points:
+            return False, float("inf"), float("inf")
+        old = old_models[0]
+        if any(not np.allclose(model, old, rtol=0.0, atol=1e-12) for model in old_models[1:]):
+            return False, float("inf"), float("inf")
+        points = np.asarray(sample_points, dtype=np.float64).reshape(-1, 1, 2)
+        old_rays = cv2.undistortPoints(
+            points, intrinsics_matrix(old), distortion_vector(old),
+        ).reshape(-1, 2)
+        new_rays = cv2.undistortPoints(
+            points, intrinsics_matrix(current), distortion_vector(current),
+        ).reshape(-1, 2)
+        pixel_scale = np.array([current[0], current[1]], dtype=np.float64)
+        shifts = np.linalg.norm((new_rays - old_rays) * pixel_scale, axis=1)
+        shifts = shifts[np.isfinite(shifts)]
+        if shifts.size == 0:
+            return False, float("inf"), float("inf")
+        p95 = float(np.percentile(shifts, 95))
+        maximum = float(np.max(shifts))
+        return p95 <= 0.02 and maximum <= 0.05, p95, maximum
+
+    updated: dict[str, int] = {}
+    all_images = sum(len(images) for images in detections_by_camera.values())
+    all_observations = sum(
+        len(image.detections)
+        for images in detections_by_camera.values()
+        for image in images
+    )
+    print(
+        "  calibrated centre refinement: refining existing detections; "
+        "missing ellipse geometry is recovered from bounded image regions; "
+        f"images={all_images}, observations={all_observations}",
+        flush=True,
+    )
+    for cam_name, images in detections_by_camera.items():
+        intrinsics = camera_intrinsics.get(cam_name)
+        if intrinsics is None:
+            continue
+        cache_current, model_p95, model_max = cached_model_is_current(images, intrinsics)
+        if cache_current:
+            updated[cam_name] = 0
+            print(
+                f"    {cam_name}: cached refined coordinates reused "
+                f"(camera-model change p95={model_p95:.4f}px, max={model_max:.4f}px)",
+                flush=True,
+            )
+            continue
+        detector = CCTDetector(n_bits=14)
+        count = 0
+        accepted = 0
+        unavailable = 0
+        recovered = 0
+        displacements: list[float] = []
+        started = time.perf_counter()
+        last_progress = started
+        evidence_before = sum(
+            len(set(image.detections) & set(image.refinement_ellipses)) for image in images
+        )
+        print(
+            f"    {cam_name}: {len(images)} images, "
+            f"cached detections={evidence_before}/{sum(len(image.detections) for image in images)}",
+            flush=True,
+        )
+        for image_number, image_record in enumerate(images, start=1):
+            image = cv2.imread(str(image_record.image_path))
+            if image is None:
+                unavailable += len(image_record.detections)
+                continue
+            raw_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            prepared_gray: np.ndarray | None = None
+            for target_id in list(image_record.detections):
+                previous = image_record.detections[target_id]
+                ellipse = image_record.refinement_ellipses.get(target_id)
+                if ellipse is None:
+                    ellipse = recover_verified_ellipse(
+                        image, int(target_id), np.asarray(previous, dtype=np.float64), detector,
+                    )
+                    if ellipse is not None:
+                        image_record.refinement_ellipses[target_id] = ellipse
+                        image_record.raw_detections[target_id] = np.asarray(
+                            ellipse[0], dtype=np.float64,
+                        )
+                        recovered += 1
+                if ellipse is None:
+                    image_record.refinement_status[target_id] = {
+                        "method": "unchanged",
+                        "intrinsics": [float(value) for value in intrinsics],
+                        "reason": "verified ellipse unavailable after bounded local recovery",
+                        "recovery_exhausted": True,
+                    }
+                    unavailable += 1
+                    continue
+                image_record.raw_detections.setdefault(
+                    target_id, np.asarray(ellipse[0], dtype=np.float64),
+                )
+                if prepared_gray is None:
+                    prepared_gray = prepare_refinement_image(raw_gray)
+                estimate = refine_projected_center(
+                    prepared_gray, ellipse, intrinsics, image_is_prepared=True,
+                )
+                radius = max(ellipse[1]) / 2.0
+                measured = np.asarray(estimate.projected_center_px, dtype=np.float64)
+                shift_from_ellipse = float(np.linalg.norm(measured - np.asarray(ellipse[0])))
+                if (
+                    not estimate.valid
+                    or not np.all(np.isfinite(measured))
+                    or shift_from_ellipse > max(2.0, 0.5 * radius)
+                ):
+                    image_record.refinement_status[target_id] = {
+                        "method": "unchanged",
+                        "intrinsics": [float(value) for value in intrinsics],
+                        "reason": estimate.reason if not estimate.valid else "centre displacement gate",
+                        "edge_rms_px": (
+                            float(estimate.edge_rms_px)
+                            if np.isfinite(estimate.edge_rms_px) else None
+                        ),
+                    }
+                    unavailable += 1
+                    continue
+                displacement = float(np.linalg.norm(measured - previous))
+                displacements.append(displacement)
+                accepted += 1
+                if displacement > 1e-9:
+                    image_record.detections[target_id] = measured
+                    count += 1
+                image_record.refinement_status[target_id] = {
+                    "method": estimate.method,
+                    "intrinsics": [float(value) for value in intrinsics],
+                    "reason": estimate.reason,
+                    "edge_rms_px": (
+                        float(estimate.edge_rms_px)
+                        if np.isfinite(estimate.edge_rms_px) else None
+                    ),
+                }
+            now = time.perf_counter()
+            if image_number == len(images) or image_number % 20 == 0 or now - last_progress >= 10.0:
+                elapsed = max(now - started, 1e-9)
+                rate = image_number / elapsed
+                eta = (len(images) - image_number) / max(rate, 1e-9)
+                print(
+                    f"      {cam_name}: {image_number}/{len(images)} images; "
+                    f"accepted={accepted}, recovered={recovered}, unavailable={unavailable}; "
+                    f"{rate:.2f} images/s, ETA={eta / 60.0:.1f} min",
+                    flush=True,
+                )
+                last_progress = now
+        updated[cam_name] = count
+        elapsed = time.perf_counter() - started
+        if displacements:
+            displacement_values = np.asarray(displacements, dtype=np.float64)
+            displacement_text = (
+                f"median={np.median(displacement_values):.4f}px, "
+                f"p95={np.percentile(displacement_values, 95):.4f}px, "
+                f"max={np.max(displacement_values):.4f}px"
+            )
+        else:
+            displacement_text = "no accepted coordinate updates"
+        print(
+            f"    {cam_name}: finished in {elapsed:.1f}s; changed={count}, "
+            f"accepted={accepted}, locally recovered detections={recovered}, unavailable={unavailable}; "
+            + displacement_text,
+            flush=True,
+        )
+    return updated
+
+
+def _persist_refined_detection_cache(
+    detections_by_camera: Dict[str, List[ImageDetections]],
+    output_dir: Path,
+) -> None:
+    """Merge refined coordinates into the cache without dropping raw frames.
+
+    ``detections_by_camera`` contains only frames admitted by the current
+    minimum-detection filter, whereas the original cache may also contain
+    rejected frames.  Rewriting it from the filtered list would make changing
+    that threshold on a later run irreversible, so update matching rows in
+    place and preserve every other cached row.
+    """
+    for cam_name, images in detections_by_camera.items():
+        cache_path = output_dir / cam_name / "target_detections.txt"
+        updates = {
+            (image.image_path.name, int(target_id)): np.asarray(point, dtype=np.float64)
+            for image in images
+            for target_id, point in image.detections.items()
+        }
+        if not updates:
+            continue
+        existing = cache_path.read_text(encoding="utf-8").splitlines() if cache_path.exists() else []
+        lines = ["image_name\ttarget_id\tx_image\ty_image"]
+        seen: set[tuple[str, int]] = set()
+        for line in existing:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("image_name"):
+                continue
+            fields = stripped.split()
+            if len(fields) != 4:
+                continue
+            try:
+                key = (fields[0], int(fields[1]))
+            except ValueError:
+                continue
+            point = updates.get(key)
+            if point is None:
+                lines.append(stripped)
+            else:
+                lines.append(f"{key[0]}\t{key[1]}\t{float(point[0]):.6f}\t{float(point[1]):.6f}")
+                seen.add(key)
+        # A cache produced by an older filtered run may not contain every
+        # currently retained key; append those coordinates deterministically.
+        for key in sorted(set(updates) - seen):
+            point = updates[key]
+            lines.append(f"{key[0]}\t{key[1]}\t{float(point[0]):.6f}\t{float(point[1]):.6f}")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        save_refinement_cache(images, cache_path.parent, merge_existing=True)
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +1002,7 @@ def initialize_multi_camera_state(
     init_reproj_tolerance: float = 50.0,
     known_targets3d: Dict[int, np.ndarray] | None = None,
     known_baseline: float | None = None,
+    reuse_known_world_poses: bool = False,
 ) -> MultiCameraState:
     """Build a MultiCameraState from SfM outputs and CCT detections.
 
@@ -624,44 +1010,79 @@ def initialize_multi_camera_state(
     Camera intrinsics come from SfM as initial values.
     3D target positions are triangulated from multi-view CCT observations,
     or taken from ``known_targets3d`` when available.
+
+    If ``reuse_known_world_poses`` is true, the input poses are fixed-K PnP
+    solutions in the known target coordinate system and are reused directly;
+    only timestamps missing from the reference camera are recovered from other
+    solved cameras.
     """
     ref_cam = camera_names[0]
 
     # Compute relative poses
     relative_poses: Dict[str, np.ndarray] = {ref_cam: identity_pose()}
     baseline_value, baseline_vector = parse_known_baseline_argument(known_baseline)
-    scale_factor = 1.0
     for cam_name in camera_names[1:]:
         relative_poses[cam_name] = _compute_relative_pose(
             sfm_poses[ref_cam], sfm_poses[cam_name],
         )
-        if baseline_vector is not None:
-            relative_poses[cam_name][3:] = baseline_vector
-        elif baseline_value is not None:
-            rp = relative_poses[cam_name]
-            t_norm = float(np.linalg.norm(rp[3:]))
-            if t_norm > 1e-9:
-                scale_factor = baseline_value / t_norm
 
-    # Apply scale factor to ALL translations (rig poses + relative poses)
-    if baseline_value is not None and abs(scale_factor - 1.0) > 1e-12:
-        for cam_name in camera_names[1:]:
-            relative_poses[cam_name][3:] *= scale_factor
+    # SfM is up to scale.  For a free SfM reconstruction, rescale every
+    # relative translation once using only the cam0-cam1 baseline.  Known
+    # metric target coordinates are already in a physical unit and must never
+    # be rescaled.  In that branch an optional baseline is an explicit metric
+    # constraint on cam0-cam1 only; it must not distort the other camera
+    # translations.
+    scale_factor = 1.0
+    if baseline_value is not None or baseline_vector is not None:
+        if len(camera_names) < 2:
+            raise ValueError("A baseline constraint requires at least two cameras")
+        estimated = relative_poses[camera_names[1]]
+        norm = float(np.linalg.norm(estimated[3:]))
+        if norm <= 1e-9:
+            raise ValueError("Cannot establish scene scale from a zero cam0-cam1 baseline")
+        requested = baseline_value if baseline_value is not None else float(np.linalg.norm(baseline_vector))
+        if reuse_known_world_poses:
+            if baseline_vector is not None:
+                relative_poses[camera_names[1]][3:] = baseline_vector
+            else:
+                relative_poses[camera_names[1]][3:] *= requested / norm
+            print(
+                "known-world poses retained in metric coordinates; baseline "
+                f"applied only to {ref_cam}->{camera_names[1]}", flush=True,
+            )
+        else:
+            scale_factor = requested / norm
+            for cam_name in camera_names[1:]:
+                relative_poses[cam_name][3:] *= scale_factor
+
+    if baseline_vector is not None and not reuse_known_world_poses:
+        relative_poses[camera_names[1]][3:] = baseline_vector
 
     for cam_name in camera_names[1:]:
-        print(f"relative pose {ref_cam}→{cam_name}: "
+        print(f"relative pose {ref_cam}->{cam_name}: "
               f"t=[{relative_poses[cam_name][3]:.4f}, {relative_poses[cam_name][4]:.4f}, {relative_poses[cam_name][5]:.4f}]"
               f" (|t|={float(np.linalg.norm(relative_poses[cam_name][3:])):.4f} m)",
               flush=True)
 
-    # Build rig poses from cam-0's SfM poses, keyed by image stem.
-    # Scale translations to match the metric baseline if specified.
+    # Build rig poses from cam-0's poses, keyed by image stem.  SfM poses are
+    # up to scale; known-world bootstrap poses already use the metric control
+    # frame and must not be rescaled by a baseline option.
     rig_poses: Dict[str, np.ndarray] = {}
     for stem, pose in sfm_poses[ref_cam].items():
         p = pose.copy()
-        if baseline_value is not None and abs(scale_factor - 1.0) > 1e-12:
+        if not reuse_known_world_poses and abs(scale_factor - 1.0) > 1e-12:
             p[3:] *= scale_factor
         rig_poses[stem] = p
+    if reuse_known_world_poses:
+        # Preserve timestamps for which the reference camera failed PnP but a
+        # secondary camera solved successfully.  Relative poses are already in
+        # the known target frame, so this is a direct frame conversion.
+        for cam_name in camera_names[1:]:
+            for stem, absolute_pose in sfm_poses[cam_name].items():
+                if stem not in rig_poses:
+                    rig_poses[stem] = remove_relative_pose(
+                        absolute_pose, relative_poses[cam_name],
+                    )
 
     # Build image_index → (cam_name, stem) mapping
     index_to_cam_stem: Dict[int, Tuple[str, str]] = {}
@@ -694,7 +1115,7 @@ def initialize_multi_camera_state(
                 fixed_point_ids.add(tid)
         print(f"  {len(fixed_point_ids)} targets matched from known targets3D file", flush=True)
 
-    if fixed_point_ids:
+    if fixed_point_ids and not reuse_known_world_poses:
         detections_by_cam_stem: Dict[str, Dict[str, ImageDetections]] = {
             cam_name: {det.image_path.stem: det for det in dets}
             for cam_name, dets in detections_by_camera.items()
@@ -764,6 +1185,12 @@ def initialize_multi_camera_state(
                 aligned_frames += 1
 
         print(f"  re-estimated {aligned_frames} rig poses from known 3D targets", flush=True)
+    elif fixed_point_ids:
+        print(
+            "  reused fixed-intrinsic known-world poses from bootstrap "
+            "(missing-frame PnP is not repeated)",
+            flush=True,
+        )
 
     reject_reasons: Dict[str, int] = {"too_few": 0, "homogeneous": 0, "non_finite": 0,
                                       "depth": 0, "reprojection": 0}
@@ -786,8 +1213,17 @@ def initialize_multi_camera_state(
             K = intrinsics_matrix(sfm_intrinsics[cam_name])
             P = K @ np.hstack([R, t])
             proj_matrices.append(P)
-            pts_2d.append(pt2d)
+            # DLT uses the ideal pinhole projection K[R|t]; measured centres
+            # remain in the original distorted image for subsequent BA.
+            undistorted = cv2.undistortPoints(
+                np.asarray(pt2d, dtype=np.float64).reshape(1, 1, 2),
+                K, distortion_vector(sfm_intrinsics[cam_name]), P=K,
+            )[0, 0]
+            pts_2d.append(undistorted)
 
+        if not np.all(np.isfinite(pts_2d)):
+            reject_reasons["non_finite"] += 1
+            continue
         # Multi-view DLT triangulation (uses all views)
         A = np.zeros((2 * len(proj_matrices), 4), dtype=np.float64)
         for i, (P, pt) in enumerate(zip(proj_matrices, pts_2d)):
@@ -839,9 +1275,8 @@ def initialize_multi_camera_state(
     if all_median_errors:
         me = np.array(all_median_errors)
         print(f"  median reprojection errors across targets: "
-              f"min={me.min():.1f} p25={np.percentile(me,25):.1f} "
-              f"median={np.median(me):.1f} p75={np.percentile(me,75):.1f} "
-              f"max={me.max():.1f} px", flush=True)
+              f"min={me.min():.1f} median={np.median(me):.1f} "
+              f"p95={np.percentile(me,95):.1f} max={me.max():.1f} px", flush=True)
     print(f"initialized {len(rig_poses)} rig frames", flush=True)
 
     state = MultiCameraState(
@@ -853,6 +1288,357 @@ def initialize_multi_camera_state(
     )
     state._fixed_point_ids = fixed_point_ids  # type: ignore[attr-defined]
     return state
+
+
+def _known_target_correspondences(
+    image: ImageDetections,
+    known_targets3d: Dict[int, np.ndarray],
+    min_shared: int,
+) -> tuple[list[int], np.ndarray, np.ndarray] | None:
+    """Return finite, non-collinear known-target correspondences for a frame."""
+    ids = sorted(set(image.detections) & set(known_targets3d))
+    required = max(6, int(min_shared))
+    if len(ids) < required:
+        return None
+
+    object_points = np.ascontiguousarray(
+        [known_targets3d[target_id] for target_id in ids], dtype=np.float64
+    )
+    image_points = np.ascontiguousarray(
+        [image.detections[target_id] for target_id in ids], dtype=np.float64
+    )
+    if object_points.ndim != 2 or object_points.shape[1] != 3:
+        return None
+    if image_points.ndim != 2 or image_points.shape[1] != 2:
+        return None
+    if not np.isfinite(object_points).all() or not np.isfinite(image_points).all():
+        return None
+
+    # Collinear controls do not constrain a camera pose reliably.  Planar
+    # control fields are valid: only the second image/object spread singular
+    # value is checked here, not the third (plane-normal) singular value.
+    if not _known_target_spread_is_valid(
+        object_points, image_points, image.width, image.height,
+    ):
+        return None
+    return ids, object_points, image_points
+
+
+def _known_target_spread_is_valid(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    width: int | float,
+    height: int | float,
+) -> bool:
+    """Check that surviving controls retain 2-D image and object spread."""
+    if (
+        len(object_points) < 2
+        or len(image_points) < 2
+        or not np.isfinite(width)
+        or not np.isfinite(height)
+        or float(width) <= 0.0
+        or float(height) <= 0.0
+    ):
+        return False
+    uv_norm = image_points / np.array([width, height], dtype=np.float64)
+    _, image_singular, _ = np.linalg.svd(
+        uv_norm - np.mean(uv_norm, axis=0), full_matrices=False,
+    )
+    _, object_singular, _ = np.linalg.svd(
+        object_points - np.mean(object_points, axis=0), full_matrices=False,
+    )
+    if (len(image_singular) < 2 or image_singular[1] /
+            max(image_singular[0], 1e-12) < 0.02):
+        return False
+    if (len(object_singular) < 2 or object_singular[1] /
+            max(object_singular[0], 1e-12) < 0.01):
+        return False
+    return True
+
+
+def _frame_descriptor(
+    image: ImageDetections,
+    correspondences: tuple[list[int], np.ndarray, np.ndarray],
+    ordinal: int,
+    total: int,
+) -> np.ndarray:
+    """Cheap geometry descriptor used before intrinsics are known."""
+    _, _, image_points = correspondences
+    normalized = image_points / np.array([image.width, image.height], dtype=np.float64)
+    centroid = np.mean(normalized, axis=0)
+    centered = normalized - centroid
+    covariance = centered.T @ centered / max(len(normalized) - 1, 1)
+    eigenvalues = np.linalg.eigvalsh(covariance)[::-1]
+    hull = cv2.convexHull(normalized.astype(np.float32).reshape(-1, 1, 2))
+    hull_area = float(cv2.contourArea(hull)) if len(hull) >= 3 else 0.0
+    log_scale = float(np.log(max(np.sqrt(hull_area), 1e-6)))
+
+    occupancy = np.zeros((6, 8), dtype=np.float64)
+    cells_x = np.clip((normalized[:, 0] * occupancy.shape[1]).astype(int), 0, occupancy.shape[1] - 1)
+    cells_y = np.clip((normalized[:, 1] * occupancy.shape[0]).astype(int), 0, occupancy.shape[0] - 1)
+    occupancy[cells_y, cells_x] = 1.0
+    time_fraction = float(ordinal / max(total - 1, 1))
+    return np.concatenate([
+        centroid,
+        [log_scale, float(eigenvalues[0]), float(eigenvalues[1]), time_fraction],
+        occupancy.reshape(-1),
+    ])
+
+
+def _select_bootstrap_frames(
+    images: Sequence[ImageDetections],
+    known_targets3d: Dict[int, np.ndarray],
+    min_shared: int,
+    max_calibration_frames: int = 24,
+    max_candidate_frames: int = 96,
+) -> tuple[list[ImageDetections], list[ImageDetections], list[ImageDetections]]:
+    """Select a bounded, deterministic, coverage-diverse calibration subset."""
+    records: list[tuple[ImageDetections, tuple[list[int], np.ndarray, np.ndarray], int]] = []
+    for ordinal, image in enumerate(images):
+        correspondences = _known_target_correspondences(image, known_targets3d, min_shared)
+        if correspondences is not None:
+            records.append((image, correspondences, ordinal))
+    if not records:
+        raise RuntimeError("No frames contain enough finite, non-collinear known 3D targets for bootstrap.")
+
+    all_records = list(records)
+    if len(records) < 8:
+        raise RuntimeError(
+            f"Only {len(records)} frames contain enough known-target geometry; "
+            "at least eight are required for a bounded intrinsic bootstrap."
+        )
+    if len(records) > max_candidate_frames:
+        # Keep a deterministic temporal scaffold, then fill it with the most
+        # supported frames so short high-quality views are not lost.
+        scaffold_count = max(1, max_candidate_frames // 2)
+        scaffold = np.linspace(0, len(records) - 1, scaffold_count, dtype=int)
+        selected_positions = set(int(index) for index in scaffold.tolist())
+        support_order = sorted(
+            range(len(records)),
+            key=lambda index: len(records[index][1][0]),
+            reverse=True,
+        )
+        for index in support_order:
+            if len(selected_positions) >= max_candidate_frames:
+                break
+            selected_positions.add(index)
+        records = [records[index] for index in sorted(selected_positions)]
+
+    descriptors = np.asarray([
+        _frame_descriptor(image, corr, ordinal, len(images))
+        for image, corr, ordinal in records
+    ], dtype=np.float64)
+    scale = np.std(descriptors, axis=0)
+    descriptors = (descriptors - np.mean(descriptors, axis=0)) / np.maximum(scale, 1e-9)
+
+    target_count = min(max_calibration_frames, len(records))
+    if target_count <= 0:
+        raise RuntimeError("No eligible bootstrap frames remain after geometry checks.")
+
+    support = np.asarray([len(corr[0]) for _, corr, _ in records], dtype=np.float64)
+    hull_score = descriptors[:, 2]
+    first = int(np.argmax(support + 0.1 * hull_score))
+    chosen = [first]
+    chosen_set = {first}
+    while len(chosen) < target_count:
+        best_index = None
+        best_score = -float("inf")
+        occupancy_counts = np.sum(
+            np.asarray([
+                _frame_descriptor(image, corr, ordinal, len(images))[-48:]
+                for image, corr, ordinal in [records[index] for index in chosen]
+            ], dtype=np.float64), axis=0,
+        ) if chosen else np.zeros(48, dtype=np.float64)
+        for index in range(len(records)):
+            if index in chosen_set:
+                continue
+            # Keep pose/scale/time geometry separate from the binary
+            # occupancy signature.  A raw 54-D Euclidean distance lets the
+            # 48 occupancy bits dominate the much more useful geometric terms.
+            geometry = descriptors[index, :6]
+            occupancy_descriptor = descriptors[index, 6:]
+            novelty = min(
+                0.7 * float(np.linalg.norm(geometry - descriptors[other, :6]) / np.sqrt(6.0))
+                + 0.3 * float(np.linalg.norm(
+                    occupancy_descriptor - descriptors[other, 6:],
+                ) / np.sqrt(48.0))
+                for other in chosen
+            )
+            occupancy = _frame_descriptor(
+                records[index][0], records[index][1], records[index][2], len(images)
+            )[-48:]
+            coverage_gain = float(np.sum(occupancy * np.maximum(0.0, 3.0 - occupancy_counts)) / 144.0)
+            frame_support = min(float(len(records[index][1][0])) / 30.0, 1.0)
+            score = 0.55 * novelty + 0.35 * coverage_gain + 0.10 * frame_support
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index is None:
+            break
+        chosen.append(best_index)
+        chosen_set.add(best_index)
+
+    chosen.sort()
+    calibration = [records[index][0] for index in chosen]
+    return calibration, [record[0] for record in records], [record[0] for record in all_records]
+
+
+def _solve_known_target_pose(
+    image: ImageDetections,
+    known_targets3d: Dict[int, np.ndarray],
+    intrinsics: np.ndarray,
+    min_shared: int,
+) -> tuple[np.ndarray, int, float] | None:
+    """Estimate one world-to-camera pose with fixed bootstrap K and distortion."""
+    correspondences = _known_target_correspondences(image, known_targets3d, min_shared)
+    if correspondences is None:
+        return None
+    _, object_points, image_points = correspondences
+    camera_matrix = intrinsics_matrix(intrinsics)
+    distortion = distortion_vector(intrinsics)
+    required_inliers = max(6, int(min_shared))
+
+    try:
+        solved, rotation_vec, translation_vec, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera_matrix,
+            distortion,
+            flags=cv2.SOLVEPNP_EPNP,
+            reprojectionError=8.0,
+            confidence=0.999,
+            iterationsCount=100,
+        )
+    except cv2.error:
+        solved, rotation_vec, translation_vec, inliers = False, None, None, None
+
+    if not solved or inliers is None or len(inliers) < required_inliers:
+        try:
+            solved, rotation_vec, translation_vec = cv2.solvePnP(
+                object_points,
+                image_points,
+                camera_matrix,
+                distortion,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            inliers = np.arange(len(object_points), dtype=np.int32).reshape(-1, 1)
+        except cv2.error:
+            return None
+    if not solved or rotation_vec is None or translation_vec is None:
+        return None
+
+    inlier_indices = np.asarray(inliers, dtype=np.int32).reshape(-1)
+    try:
+        if hasattr(cv2, "solvePnPRefineLM"):
+            rotation_vec, translation_vec = cv2.solvePnPRefineLM(
+                object_points[inlier_indices], image_points[inlier_indices],
+                camera_matrix, distortion, rotation_vec, translation_vec,
+                criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 20, 1e-7),
+            )
+        else:
+            _, rotation_vec, translation_vec = cv2.solvePnP(
+                object_points[inlier_indices], image_points[inlier_indices],
+                camera_matrix, distortion, rvec=rotation_vec, tvec=translation_vec,
+                useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+    except cv2.error:
+        return None
+
+    def evaluate_pose(candidate_rvec: np.ndarray, candidate_tvec: np.ndarray):
+        pose_value = np.concatenate(
+            [candidate_rvec.reshape(3), candidate_tvec.reshape(3)]
+        ).astype(np.float64)
+        rotation_value = rotation_matrix_from_pose(pose_value)
+        errors_value = np.asarray([
+            float(np.linalg.norm(project_point(intrinsics, pose_value, point) - measured))
+            for point, measured in zip(object_points, image_points)
+        ], dtype=np.float64)
+        depths_value = np.asarray([
+            float((rotation_value @ point + pose_value[3:])[2])
+            for point in object_points
+        ], dtype=np.float64)
+        supported_value = (
+            np.isfinite(errors_value)
+            & (errors_value <= 8.0)
+            & np.isfinite(depths_value)
+            & (depths_value > 1e-8)
+        )
+        return pose_value, errors_value, supported_value
+
+    pose, errors, supported = evaluate_pose(rotation_vec, translation_vec)
+    if int(np.count_nonzero(supported)) < required_inliers or float(np.mean(supported)) < 0.60:
+        return None
+
+    # Refine once on the support verified from actual reprojection/depth
+    # residuals.  Never trust the inlier array returned by a fallback solver as
+    # proof that every correspondence is an inlier.
+    supported_indices = np.flatnonzero(supported).astype(np.int32)
+    try:
+        if hasattr(cv2, "solvePnPRefineLM"):
+            rotation_vec, translation_vec = cv2.solvePnPRefineLM(
+                object_points[supported_indices], image_points[supported_indices],
+                camera_matrix, distortion, rotation_vec, translation_vec,
+                criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 20, 1e-7),
+            )
+        else:
+            _, rotation_vec, translation_vec = cv2.solvePnP(
+                object_points[supported_indices], image_points[supported_indices],
+                camera_matrix, distortion, rvec=rotation_vec, tvec=translation_vec,
+                useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+    except cv2.error:
+        return None
+    pose, errors, supported = evaluate_pose(rotation_vec, translation_vec)
+    support_count = int(np.count_nonzero(supported))
+    if support_count < required_inliers or support_count / len(object_points) < 0.60:
+        return None
+    supported_indices = np.flatnonzero(supported).astype(np.int32)
+    if not _known_target_spread_is_valid(
+        object_points[supported_indices], image_points[supported_indices],
+        image.width, image.height,
+    ):
+        return None
+    median_error = float(np.median(errors[supported])) if support_count else float("inf")
+    if not np.isfinite(median_error):
+        return None
+    return pose, support_count, median_error
+
+
+def _bootstrap_subset_variants(
+    calibration_frames: Sequence[ImageDetections],
+    candidate_frames: Sequence[ImageDetections],
+    max_calibration_frames: int,
+) -> list[list[ImageDetections]]:
+    """Return a small deterministic set of bounded calibration alternatives."""
+    eligible_count = len(candidate_frames)
+    # Reserve at least eight frames for validation whenever the dataset is
+    # larger than one bounded calibration subset.  This avoids the 25--31
+    # frame corner case where a 24-frame fit leaves too few held-out frames.
+    target_count = (
+        min(max_calibration_frames, eligible_count - 8)
+        if eligible_count > max_calibration_frames
+        else min(max_calibration_frames, eligible_count)
+    )
+    if target_count == 0:
+        return []
+    variants: list[list[ImageDetections]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def add(frames: Sequence[ImageDetections]) -> None:
+        if len(frames) < min(8, target_count):
+            return
+        ordered = list(frames[:target_count])
+        key = tuple(image.image_path.stem for image in ordered)
+        if key not in seen:
+            seen.add(key)
+            variants.append(ordered)
+
+    add(calibration_frames)
+    add(list(candidate_frames)[-target_count:])
+    even_indices = np.linspace(0, len(candidate_frames) - 1, target_count, dtype=int)
+    add([candidate_frames[int(index)] for index in even_indices.tolist()])
+    add(list(candidate_frames)[:target_count])
+    return variants
 
 
 def bootstrap_from_known_targets(
@@ -871,14 +1657,162 @@ def bootstrap_from_known_targets(
 
     for cam_name in camera_names:
         cam_detections = detections_by_camera.get(cam_name, [])
-        state, _ = initialize_known_target_state(cam_detections, known_targets3d, min_shared)
+        calibration_frames, candidate_frames, all_eligible_frames = _select_bootstrap_frames(
+            cam_detections,
+            known_targets3d,
+            min_shared,
+            max_calibration_frames=24,
+            max_candidate_frames=96,
+        )
+        print(
+            f"  {cam_name}: evaluating bounded calibration subsets "
+            f"({len(candidate_frames)}-frame candidate pool, {len(all_eligible_frames)} eligible total; "
+            "all retained frames will receive fixed-K PnP)",
+            flush=True,
+        )
+
+        # A single arbitrary subset can be numerically weak even when its
+        # image occupancy looks good.  Evaluate a few deterministic alternatives
+        # on held-out known-target frames, but never fall back to an unbounded
+        # all-frame calibrateCamera call.
+        best_state: CalibrationState | None = None
+        best_score: tuple[int, float, float] | None = None
+        subsets = _bootstrap_subset_variants(calibration_frames, all_eligible_frames, 24)
+        for subset_index, subset in enumerate(subsets, start=1):
+            try:
+                state_candidate, _ = initialize_known_target_state(
+                    subset, known_targets3d, min_shared,
+                )
+            except (cv2.error, ValueError) as exc:
+                print(
+                    f"    {cam_name}: subset {subset_index}/{len(subsets)} "
+                    f"calibration failed ({exc}); trying the next bounded subset",
+                    flush=True,
+                )
+                continue
+            # Reject numerically nonsensical calibrations before they can win
+            # the held-out comparison (e.g. a focal length that escaped to a
+            # degenerate local minimum).
+            width = float(subset[0].width)
+            height = float(subset[0].height)
+            candidate_intrinsics = np.asarray(state_candidate.intrinsics, dtype=np.float64)
+            if (
+                candidate_intrinsics.shape[0] < 4
+                or not np.isfinite(candidate_intrinsics).all()
+                or candidate_intrinsics[0] <= 0.0
+                or candidate_intrinsics[1] <= 0.0
+                or candidate_intrinsics[0] > 10.0 * max(width, height)
+                or candidate_intrinsics[1] > 10.0 * max(width, height)
+                or candidate_intrinsics[2] < -width
+                or candidate_intrinsics[2] > 2.0 * width
+                or candidate_intrinsics[3] < -height
+                or candidate_intrinsics[3] > 2.0 * height
+            ):
+                print(
+                    f"    {cam_name}: subset {subset_index}/{len(subsets)} "
+                    "produced implausible intrinsics; trying the next bounded subset",
+                    flush=True,
+                )
+                continue
+            subset_stems = {image.image_path.stem for image in subset}
+            validation_frames = [
+                image for image in all_eligible_frames
+                if image.image_path.stem not in subset_stems
+            ]
+            validation_kind = "held-out"
+            if not validation_frames:
+                validation_frames = list(subset)
+                validation_kind = "training-only"
+            if len(validation_frames) > 24:
+                validation_indices = np.linspace(
+                    0, len(validation_frames) - 1, 24, dtype=int,
+                )
+                validation_frames = [validation_frames[int(index)] for index in validation_indices]
+            validation_errors: list[float] = []
+            validation_solved = 0
+            for image in validation_frames:
+                solved = _solve_known_target_pose(
+                    image, known_targets3d, state_candidate.intrinsics, min_shared,
+                )
+                if solved is not None:
+                    validation_solved += 1
+                    validation_errors.append(float(solved[2]))
+
+            train_errors: list[float] = []
+            for image in subset:
+                pose = state_candidate.poses.get(image.image_index)
+                if pose is None:
+                    continue
+                correspondences = _known_target_correspondences(
+                    image, known_targets3d, min_shared,
+                )
+                if correspondences is None:
+                    continue
+                _, object_points, image_points = correspondences
+                train_errors.extend(
+                    float(np.linalg.norm(
+                        project_point(state_candidate.intrinsics, pose, point) - measured,
+                    ))
+                    for point, measured in zip(object_points, image_points)
+                )
+            validation_median = float(np.median(validation_errors)) if validation_errors else float("inf")
+            train_median = float(np.median(train_errors)) if train_errors else float("inf")
+            score = (validation_solved, -validation_median, -train_median)
+            print(
+                f"    {cam_name}: subset {subset_index}/{len(subsets)} "
+                f"frames={len(subset)}, {validation_kind} PnP="
+                f"{validation_solved}/{len(validation_frames)}, "
+                f"{validation_kind} median={validation_median:.2f} px",
+                flush=True,
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best_state = state_candidate
+
+        # Require both an absolute validation floor and a strong success
+        # fraction.  Tiny datasets may only support training-only validation,
+        # which is reported as such above and remains weaker than true holdout
+        # validation, but it may not pass when most of its own poses fail.
+        eligible_count = len(all_eligible_frames)
+        training_count = (
+            min(24, eligible_count - 8)
+            if eligible_count > 24
+            else min(24, eligible_count)
+        )
+        validation_count = (
+            eligible_count - training_count
+            if eligible_count > training_count
+            else training_count
+        )
+        validation_count = min(24, validation_count)
+        required_validation = max(8, math.ceil(0.8 * validation_count))
+        if best_state is None or best_score is None or best_score[0] < required_validation:
+            raise RuntimeError(f"{cam_name}: bounded known-target bootstrap produced no usable subset.")
+        state = best_state
         intrinsics_by_camera[cam_name] = state.intrinsics.copy()
-        detections_by_index = {det.image_index: det for det in cam_detections}
-        poses_by_camera[cam_name] = {
-            detections_by_index[image_index].image_path.stem: pose.copy()
-            for image_index, pose in state.poses.items()
-            if image_index in detections_by_index
-        }
+        poses: Dict[str, np.ndarray] = {}
+        failures = 0
+        for frame_number, image in enumerate(cam_detections, start=1):
+            solved = _solve_known_target_pose(
+                image, known_targets3d, state.intrinsics, min_shared
+            )
+            if solved is None:
+                failures += 1
+                continue
+            pose, inlier_count, median_error = solved
+            poses[image.image_path.stem] = pose
+            if frame_number % 25 == 0 or frame_number == len(cam_detections):
+                print(
+                    f"    {cam_name}: fixed-K PnP {frame_number}/{len(cam_detections)} "
+                    f"frames, solved={len(poses)}, failed={failures}",
+                    flush=True,
+                )
+        if not poses:
+            raise RuntimeError(
+                f"{cam_name}: fixed-intrinsic PnP failed for every retained frame "
+                "after known-target bootstrap."
+            )
+        poses_by_camera[cam_name] = poses
         print(
             f"  {cam_name}: bootstrapped {len(poses_by_camera[cam_name])} poses from known 3D targets, "
             f"fx={state.intrinsics[0]:.1f} fy={state.intrinsics[1]:.1f} "
@@ -1109,6 +2043,345 @@ def multi_cam_compute_object_space_errors(
     return np.array(errors, dtype=np.float64)
 
 
+def _linearised_adjustment_diagnostics(
+    problem: pyceres.Problem,
+    state: MultiCameraState,
+    observations: Sequence[Tuple[str, str, int, np.ndarray]],
+    used_rig_poses: Set[str],
+    used_points: Set[int],
+    fixed_point_ids: Set[int],
+    initial_camera_intrinsics: Dict[str, np.ndarray] | None,
+    initial_relative_poses: Dict[str, np.ndarray] | None,
+    observation_sigma_px: float | None,
+) -> AdjustmentDiagnostics:
+    """Extract marginal covariance and residual reliability from Ceres.
+
+    The covariance is evaluated on the un-robustified final least-squares
+    problem.  Ceres marginalises all unrequested frame/point blocks, so the
+    reported camera covariance includes their uncertainty.
+    """
+    from scipy import sparse
+    from scipy.sparse.linalg import lsmr
+    from scipy.stats import chi2
+
+    warnings: List[str] = []
+    intr_names = ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2"]
+    pose_names = ["rx", "ry", "rz", "tx", "ty", "tz"]
+
+    # Keep blocks exactly as they were passed to Ceres: array identity matters.
+    global_specs: List[Tuple[List[str], np.ndarray, np.ndarray, List[str]]] = []
+
+    def _status_for(block: np.ndarray, index: int, base: str) -> str:
+        if base.startswith("fixed"):
+            return base
+        if problem.has_manifold(block):
+            base = f"{base} (manifold-constrained)"
+        try:
+            lower = float(problem.get_parameter_lower_bound(block, index))
+            upper = float(problem.get_parameter_upper_bound(block, index))
+            value = float(block[index])
+            tolerance = 1e-7 * max(1.0, abs(value), abs(lower) if np.isfinite(lower) else 0.0, abs(upper) if np.isfinite(upper) else 0.0)
+            if np.isfinite(lower) and abs(value - lower) <= tolerance:
+                base += " [active lower bound]"
+            elif np.isfinite(upper) and abs(value - upper) <= tolerance:
+                base += " [active upper bound]"
+        except (TypeError, ValueError, RuntimeError):
+            pass
+        return base
+    for cam_name in state.camera_names:
+        block = state.camera_intrinsics[cam_name]
+        status = "fixed" if problem.is_parameter_block_constant(block) else "estimated"
+        initial = (initial_camera_intrinsics or {}).get(cam_name, block).copy()
+        global_specs.append((
+            [f"{cam_name}.{name}" for name in intr_names], block, initial,
+            [_status_for(block, index, status) for index in range(block.size)],
+        ))
+
+    ref_cam = state.camera_names[0]
+    for cam_name in state.camera_names:
+        rp = state.relative_poses[cam_name]
+        initial_rp = (initial_relative_poses or {}).get(cam_name, rp).copy()
+        for suffix, block, initial, names in (
+            ("rotation", rp[:3], initial_rp[:3], pose_names[:3]),
+            ("translation", rp[3:], initial_rp[3:], pose_names[3:]),
+        ):
+            if cam_name == ref_cam:
+                label = "fixed (rig reference)"
+            elif problem.is_parameter_block_constant(block):
+                label = "fixed/constrained"
+            elif problem.has_manifold(block):
+                label = "estimated (manifold-constrained)"
+            else:
+                label = "estimated"
+            global_specs.append((
+                [f"{cam_name}.{name}" for name in names], block, initial,
+                [_status_for(block, index, label) for index in range(block.size)],
+            ))
+
+    names = [name for spec in global_specs for name in spec[0]]
+    initial = np.concatenate([spec[2] for spec in global_specs]).astype(np.float64)
+    final = np.concatenate([spec[1] for spec in global_specs]).astype(np.float64)
+    statuses = [status for spec in global_specs for status in spec[3]]
+    n_global = len(names)
+    covariance = np.full((n_global, n_global), np.nan, dtype=np.float64)
+
+    # Active parameter blocks in an explicit order for the adjustment Jacobian.
+    active_blocks: List[np.ndarray] = []
+    for cam_name in state.camera_names:
+        block = state.camera_intrinsics[cam_name]
+        if problem.has_parameter_block(block) and not problem.is_parameter_block_constant(block):
+            active_blocks.append(block)
+    for stem in sorted(used_rig_poses):
+        block = state.rig_poses[stem]
+        if not problem.is_parameter_block_constant(block):
+            active_blocks.append(block)
+    for cam_name in state.camera_names:
+        rp = state.relative_poses[cam_name]
+        for block in (rp[:3], rp[3:]):
+            if problem.has_parameter_block(block) and not problem.is_parameter_block_constant(block):
+                active_blocks.append(block)
+    for target_id in sorted(used_points):
+        block = state.points[target_id]
+        if target_id not in fixed_point_ids and not problem.is_parameter_block_constant(block):
+            active_blocks.append(block)
+
+    eval_options = pyceres.EvaluateOptions()
+    eval_options.apply_loss_function = False
+    eval_options.set_parameter_blocks(active_blocks)
+    jac_crs = problem.evaluate_jacobian(eval_options)
+    row_index, col_index, values = jac_crs.to_tuple()
+    jacobian = sparse.coo_matrix(
+        (values, (row_index, col_index)),
+        shape=(jac_crs.num_rows, jac_crs.num_cols),
+        dtype=np.float64,
+    ).tocsr()
+    residual = np.asarray(problem.evaluate_residuals(), dtype=np.float64)
+    # The evaluated Jacobian is in Ceres tangent coordinates (important for
+    # manifold-constrained blocks).  Estimate numerical rank on column-scaled
+    # columns.  Dense SVD is exact for small reports; larger reports use a
+    # conservative sparse small-spectrum estimate and are explicitly marked
+    # unverified rather than claiming m-n determinability.
+    column_norms = np.sqrt(np.asarray(jacobian.power(2).sum(axis=0)).reshape(-1))
+    column_scale = np.divide(
+        1.0, column_norms, out=np.ones_like(column_norms), where=column_norms > 1e-12,
+    )
+    scaled_jacobian = jacobian @ sparse.diags(column_scale)
+    rank_verified = False
+    rank_tolerance: float | None = None
+    singular_values: np.ndarray | None = None
+    weakest_singular_values: np.ndarray | None = None
+    numerical_rank: int | None = None
+    exact_left_vectors: np.ndarray | None = None
+    if scaled_jacobian.shape[1] == 0:
+        numerical_rank = 0
+        rank_verified = True
+        rank_tolerance = 0.0
+    elif scaled_jacobian.shape[1] <= 600:
+        dense_jacobian = scaled_jacobian.toarray()
+        exact_left_vectors, singular_values, _ = np.linalg.svd(dense_jacobian, full_matrices=False)
+        rank_tolerance = float(max(scaled_jacobian.shape) * np.finfo(float).eps * max(float(singular_values[0]), 1.0))
+        numerical_rank = int(np.count_nonzero(singular_values > rank_tolerance))
+        weakest_singular_values = singular_values[-min(12, len(singular_values)):].copy()
+        rank_verified = True
+    else:
+        from scipy.sparse.linalg import svds
+        try:
+            k = min(24, scaled_jacobian.shape[1] - 1, scaled_jacobian.shape[0] - 1)
+            small = np.sort(np.abs(svds(scaled_jacobian, k=k, which="SM", return_singular_vectors=False, maxiter=4000))) if k > 0 else np.empty(0)
+            large = np.abs(svds(scaled_jacobian, k=1, which="LM", return_singular_vectors=False, maxiter=4000))
+            rank_tolerance = float(max(scaled_jacobian.shape) * np.finfo(float).eps * max(float(large[-1]), 1.0))
+            nullity_estimate = int(np.count_nonzero(small <= rank_tolerance))
+            numerical_rank = int(min(scaled_jacobian.shape[0], scaled_jacobian.shape[1] - nullity_estimate))
+            weakest_singular_values = small
+            warnings.append(
+                "Numerical rank is estimated from sparse extreme singular values; full rank is unverified for this problem size."
+            )
+        except Exception as exc:
+            warnings.append(f"Numerical rank could not be estimated ({exc}); DOF is unavailable.")
+    if numerical_rank is None:
+        dof = 0
+    else:
+        dof = int(jacobian.shape[0] - numerical_rank)
+    if dof <= 0:
+        warnings.append("Non-positive degrees of freedom after rank analysis; variance-factor statistics are unavailable.")
+    rss = float(residual @ residual)
+    variance_factor = float(rss / dof) if dof > 0 else float("nan")
+    sigma0 = float(np.sqrt(max(variance_factor, 0.0))) if np.isfinite(variance_factor) else float("nan")
+
+    chi_stat: float | None = None
+    chi_p: float | None = None
+    chi_consistent: bool | None = None
+    if observation_sigma_px is not None and observation_sigma_px > 0 and dof > 0:
+        chi_stat = rss / float(observation_sigma_px ** 2)
+        lower = float(chi2.ppf(0.025, dof))
+        upper = float(chi2.ppf(0.975, dof))
+        chi_consistent = bool(lower <= chi_stat <= upper)
+        chi_p = float(2.0 * min(chi2.cdf(chi_stat, dof), chi2.sf(chi_stat, dof)))
+    elif observation_sigma_px is None:
+        warnings.append(
+            "No a-priori image-coordinate sigma was supplied; the residual variance ratio is unavailable."
+        )
+        if not rank_verified:
+            warnings.append(
+                "Residual variance diagnostics use degrees of freedom from the sparse numerical-rank estimate."
+            )
+    elif numerical_rank is None:
+        warnings.append(
+            "Residual variance diagnostics are unavailable because numerical rank could not be estimated."
+        )
+
+    # Marginal covariance of global calibration blocks.
+    variable_specs: List[Tuple[int, np.ndarray]] = []
+    offset = 0
+    for spec in global_specs:
+        block = spec[1]
+        if problem.has_parameter_block(block) and not problem.is_parameter_block_constant(block):
+            variable_specs.append((offset, block))
+        offset += block.size
+
+    covariance_method = "Ceres SPARSE_QR marginal covariance"
+    rank_deficient = numerical_rank is not None and numerical_rank < jacobian.shape[1]
+    if rank_deficient:
+        covariance_method = "unavailable (rank-deficient tangent Jacobian)"
+        warnings.append(
+            "Marginal covariance was suppressed because the tangent Jacobian has unresolved null directions."
+        )
+    elif variable_specs:
+        pairs = [(a[1], b[1]) for i, a in enumerate(variable_specs) for b in variable_specs[i:]]
+        options = pyceres.CovarianceOptions()
+        options.algorithm_type = pyceres.CovarianceAlgorithmType.SPARSE_QR
+        options.apply_loss_function = False
+        options.num_threads = -1
+        cov_solver = pyceres.Covariance(options)
+        ok = bool(cov_solver.compute(pairs, problem))
+        if not ok:
+            warnings.append("Ceres SPARSE_QR covariance failed; retrying with dense SVD.")
+            covariance_method = "Ceres DENSE_SVD marginal covariance"
+            options.algorithm_type = pyceres.CovarianceAlgorithmType.DENSE_SVD
+            cov_solver = pyceres.Covariance(options)
+            ok = bool(cov_solver.compute(pairs, problem))
+        if ok:
+            for i, (off_i, block_i) in enumerate(variable_specs):
+                ni = block_i.size
+                for off_j, block_j in variable_specs[i:]:
+                    nj = block_j.size
+                    cov_block = np.asarray(
+                        cov_solver.get_covariance_block(block_i, block_j),
+                        dtype=np.float64,
+                    ).reshape(ni, nj)
+                    cov_block *= variance_factor
+                    covariance[off_i:off_i + ni, off_j:off_j + nj] = cov_block
+                    covariance[off_j:off_j + nj, off_i:off_i + ni] = cov_block.T
+        else:
+            covariance_method = "unavailable"
+            warnings.append("Marginal covariance could not be computed; parameter uncertainties are unavailable.")
+
+    correlation = np.full_like(covariance, np.nan)
+    estimated = np.flatnonzero(np.isfinite(np.diag(covariance)) & (np.diag(covariance) >= 0))
+    if estimated.size:
+        std = np.sqrt(np.maximum(np.diag(covariance)[estimated], 0.0))
+        denom = np.outer(std, std)
+        sub = covariance[np.ix_(estimated, estimated)]
+        corr_sub = np.divide(sub, denom, out=np.zeros_like(sub), where=denom > 0)
+        np.fill_diagonal(corr_sub, 1.0)
+        correlation[np.ix_(estimated, estimated)] = corr_sub
+        try:
+            condition_number = float(np.linalg.cond(corr_sub))
+        except np.linalg.LinAlgError:
+            condition_number = float("inf")
+        warnings.append(
+            "Correlation condition number describes parameter coupling only; it is not an absolute observability certificate."
+        )
+    else:
+        condition_number = float("nan")
+
+    # Approximate the diagonal of the hat matrix with deterministic Hutchinson
+    # probes. This accounts for all active nuisance parameters without forming
+    # the full inverse normal matrix.
+    n_residuals = jacobian.shape[0]
+    leverage = np.full(n_residuals, np.nan, dtype=np.float64)
+    leverage_reliable = False
+    if exact_left_vectors is not None and numerical_rank is not None:
+        leverage = np.sum(exact_left_vectors[:, :numerical_rank] ** 2, axis=1)
+        leverage_reliable = bool(np.all(np.isfinite(leverage)))
+    elif n_residuals and jacobian.shape[1]:
+        rng = np.random.default_rng(20260826)
+        estimate = np.zeros(n_residuals, dtype=np.float64)
+        n_probes = 24
+        probe_failures = 0
+        for _ in range(n_probes):
+            z = rng.choice(np.array([-1.0, 1.0]), size=n_residuals)
+            solve_result = lsmr(
+                scaled_jacobian, z, atol=1e-8, btol=1e-8,
+                maxiter=max(200, min(2500, 3 * jacobian.shape[1])),
+            )
+            solution, istop, normr = solve_result[0], int(solve_result[1]), float(solve_result[3])
+            if istop not in (1, 2) or not np.isfinite(normr):
+                probe_failures += 1
+                continue
+            estimate += z * np.asarray(scaled_jacobian @ solution).reshape(-1)
+        if probe_failures == 0:
+            leverage = estimate / n_probes
+            leverage_reliable = bool(np.all(np.isfinite(leverage)))
+        else:
+            warnings.append(f"Local redundancy was suppressed: {probe_failures}/{n_probes} projection probes did not converge.")
+    if leverage_reliable:
+        leverage = np.minimum(np.maximum(leverage, 0.0), 1.0)
+        if abs(float(np.sum(leverage)) - float(numerical_rank or 0)) > max(1.0, 0.05 * max(float(numerical_rank or 0), 1.0)):
+            leverage_reliable = False
+            warnings.append("Local redundancy was suppressed: estimated hat-matrix trace disagreed with numerical rank.")
+    if not leverage_reliable:
+        leverage[:] = np.nan
+    redundancy = 1.0 - leverage
+    scale = sigma0 * np.sqrt(np.maximum(redundancy, 0.0))
+    standardized = np.divide(
+        residual, scale,
+        out=np.full_like(residual, np.nan),
+        where=np.isfinite(scale) & (scale > 0),
+    )
+    if residual.size != 2 * len(observations):
+        warnings.append(
+            "Residual ordering did not match the observation list; local reliability values were not attached."
+        )
+        leverage_uv = np.zeros((0, 2), dtype=np.float64)
+        redundancy_uv = np.zeros((0, 2), dtype=np.float64)
+        standardized_uv = np.zeros((0, 2), dtype=np.float64)
+    else:
+        leverage_uv = leverage.reshape(-1, 2)
+        redundancy_uv = redundancy.reshape(-1, 2)
+        standardized_uv = standardized.reshape(-1, 2)
+
+    return AdjustmentDiagnostics(
+        parameter_names=names,
+        parameter_initial=initial,
+        parameter_final=final,
+        parameter_status=statuses,
+        covariance=covariance,
+        correlation=correlation,
+        sigma0_px=sigma0,
+        dof=dof,
+        variance_factor=variance_factor,
+        observation_sigma_px=observation_sigma_px,
+        chi_square_statistic=chi_stat,
+        chi_square_p_value=chi_p,
+        chi_square_consistent_95=chi_consistent,
+        condition_number=condition_number,
+        leverage_uv=leverage_uv,
+        local_redundancy_uv=redundancy_uv,
+        standardized_residuals_uv=standardized_uv,
+        covariance_method=covariance_method,
+        warnings=warnings,
+        jacobian_rows=int(jacobian.shape[0]),
+        jacobian_columns=int(jacobian.shape[1]),
+        numerical_rank=numerical_rank,
+        rank_tolerance=rank_tolerance,
+        rank_verified=rank_verified,
+        nullity=(int(jacobian.shape[1] - numerical_rank) if numerical_rank is not None else None),
+        singular_values=singular_values,
+        weakest_singular_values=weakest_singular_values,
+    )
+
+
 def solve_multi_cam_bundle_adjustment(
     state: MultiCameraState,
     observations: Sequence[Tuple[str, str, int, np.ndarray]],
@@ -1123,6 +2396,10 @@ def solve_multi_cam_bundle_adjustment(
     fix_intrinsics: bool = False,
     fixed_point_ids: Set[int] | None = None,
     known_baseline: float | None = None,
+    collect_adjustment_diagnostics: bool = False,
+    initial_camera_intrinsics: Dict[str, np.ndarray] | None = None,
+    initial_relative_poses: Dict[str, np.ndarray] | None = None,
+    observation_sigma_px: float | None = None,
 ) -> SolverDiagnostics:
     """Joint bundle adjustment over all cameras.
 
@@ -1133,9 +2410,16 @@ def solve_multi_cam_bundle_adjustment(
       - 3D point (3)
 
     The first rig frame is held constant (gauge freedom).
-    Relative poses are held constant to enforce the rig constraint.
+    Relative poses are held constant by default to enforce the rig constraint.
+    A supplied scalar baseline adds an exact cam0-cam1 translation-norm
+    manifold; a supplied XYZ vector fixes only that cam0-cam1 translation.
     """
     problem = pyceres.Problem()
+    baseline_value, baseline_vector = parse_known_baseline_argument(known_baseline)
+    constrained_baseline_camera = state.camera_names[1] if len(state.camera_names) > 1 else None
+    baseline_manifold = None
+    if baseline_vector is not None and constrained_baseline_camera is not None:
+        state.relative_poses[constrained_baseline_camera][3:] = baseline_vector
     if robust_loss == "cauchy":
         loss = pyceres.CauchyLoss(cauchy_scale)
     elif robust_loss == "none":
@@ -1174,14 +2458,33 @@ def solve_multi_cam_bundle_adjustment(
     problem.set_parameter_block_constant(state.relative_poses[ref_cam][:3])
     problem.set_parameter_block_constant(state.relative_poses[ref_cam][3:])
 
-    # Optionally fix the remaining relative poses (rig constraint).
+    # Optionally fix the remaining relative poses (rig constraint).  A known
+    # vector fixes cam0-cam1 translation components.  A scalar constrains only
+    # its norm and leaves the two direction degrees of freedom adjustable.
     if fix_relative_poses:
         for cam_name in state.camera_names[1:]:
             problem.set_parameter_block_constant(state.relative_poses[cam_name][:3])
             problem.set_parameter_block_constant(state.relative_poses[cam_name][3:])
+    elif baseline_vector is not None and constrained_baseline_camera is not None:
+        problem.set_parameter_block_constant(state.relative_poses[constrained_baseline_camera][3:])
     elif fix_relative_pose_translations:
         for cam_name in state.camera_names[1:]:
             problem.set_parameter_block_constant(state.relative_poses[cam_name][3:])
+
+    if (
+        baseline_value is not None
+        and constrained_baseline_camera is not None
+        and not fix_relative_poses
+    ):
+        translation = state.relative_poses[constrained_baseline_camera][3:]
+        norm = float(np.linalg.norm(translation))
+        if norm <= 1e-12:
+            raise ValueError("cam0-cam1 translation is zero; cannot apply a scalar baseline constraint")
+        translation[:] *= float(baseline_value) / norm
+        # Keep this object alive through solve/evaluation; Ceres stores the
+        # manifold pointer but not ownership in all Python bindings.
+        baseline_manifold = pyceres.SphereManifold(3)
+        problem.set_manifold(translation, baseline_manifold)
 
     # Fix known 3D points (metric ground truth)
     if fixed_point_ids:
@@ -1234,13 +2537,26 @@ def solve_multi_cam_bundle_adjustment(
     summary = pyceres.SolverSummary()
     pyceres.solve(options, problem, summary)
     cost_history = callback.cost_history or [float(summary.initial_cost), float(summary.final_cost)]
-    return SolverDiagnostics(
+    diagnostics = SolverDiagnostics(
         summary=summary.BriefReport(),
-        iterations=int(summary.num_successful_steps + summary.num_unsuccessful_steps + 1),
+        iterations=int(summary.num_successful_steps + summary.num_unsuccessful_steps),
         initial_cost=float(summary.initial_cost),
         final_cost=float(summary.final_cost),
         cost_history=[float(c) for c in cost_history],
     )
+    if collect_adjustment_diagnostics:
+        diagnostics.adjustment = _linearised_adjustment_diagnostics(
+            problem=problem,
+            state=state,
+            observations=observations,
+            used_rig_poses=set(used_rig_poses),
+            used_points=set(used_points),
+            fixed_point_ids=set(fixed_point_ids or set()),
+            initial_camera_intrinsics=initial_camera_intrinsics,
+            initial_relative_poses=initial_relative_poses,
+            observation_sigma_px=observation_sigma_px,
+        )
+    return diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -1478,9 +2794,221 @@ def save_kalibr_camchain(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def partition_independent_checkpoints(
+    detections_by_camera: Dict[str, List[ImageDetections]],
+    known_targets3d: Dict[int, np.ndarray],
+    ratio: float,
+    seed: int,
+    min_detections: int,
+) -> tuple[Dict[str, List[ImageDetections]], Set[int], dict]:
+    """Remove selected target IDs from every calibration input container."""
+    observed_ids = {
+        int(target_id)
+        for images in detections_by_camera.values()
+        for image in images
+        for target_id in image.detections
+    }
+    eligible = sorted(
+        target_id for target_id, point in known_targets3d.items()
+        if target_id in observed_ids
+        and np.asarray(point).shape == (3,)
+        and np.all(np.isfinite(point))
+    )
+    count = int(math.ceil(ratio * len(eligible)))
+    if not eligible or count < 1:
+        raise ValueError("no observed finite known targets are eligible for checkpoints")
+    if count >= len(eligible):
+        raise ValueError(
+            f"checkpoint split would withhold all {len(eligible)} eligible targets; reduce the ratio"
+        )
+    rng = np.random.Generator(np.random.PCG64(seed))
+    checkpoint_ids = {int(value) for value in rng.choice(eligible, count, replace=False)}
+
+    checkpoint_images: Dict[str, List[ImageDetections]] = {}
+    for camera, images in detections_by_camera.items():
+        retained: List[ImageDetections] = []
+        checks: List[ImageDetections] = []
+        for source in images:
+            check = copy.deepcopy(source)
+            check.detections = {
+                tid: point for tid, point in check.detections.items() if tid in checkpoint_ids
+            }
+            check.raw_detections = {
+                tid: point for tid, point in check.raw_detections.items() if tid in checkpoint_ids
+            }
+            check.refinement_ellipses = {
+                tid: value for tid, value in check.refinement_ellipses.items() if tid in checkpoint_ids
+            }
+            check.refinement_status = {
+                tid: value for tid, value in check.refinement_status.items() if tid in checkpoint_ids
+            }
+            if check.detections:
+                checks.append(check)
+
+            for mapping_name in (
+                "detections", "raw_detections", "refinement_ellipses", "refinement_status",
+            ):
+                mapping = getattr(source, mapping_name)
+                for target_id in checkpoint_ids:
+                    mapping.pop(target_id, None)
+            if len(source.detections) >= min_detections:
+                retained.append(source)
+        detections_by_camera[camera] = retained
+        checkpoint_images[camera] = checks
+
+    manifest = {
+        "enabled": True,
+        "requested_ratio": float(ratio),
+        "realized_ratio": float(count / len(eligible)),
+        "seed": int(seed),
+        "generator": "numpy.PCG64",
+        "detection_cache_reused": False,
+        "sfm_uses_cct_target_ids_or_reference_coordinates": False,
+        "eligible_target_ids": eligible,
+        "checkpoint_target_ids": sorted(checkpoint_ids),
+        "calibration_target_ids": sorted(set(eligible) - checkpoint_ids),
+    }
+    return checkpoint_images, checkpoint_ids, manifest
+
+
+def evaluate_independent_checkpoints(
+    state: MultiCameraState,
+    checkpoint_images: Dict[str, List[ImageDetections]],
+    checkpoint_ids: Set[int],
+    known_targets3d: Dict[int, np.ndarray],
+    calibrated_frame_stems: Set[str],
+) -> dict:
+    """Evaluate withheld targets with the final calibration held fixed."""
+    by_target: Dict[int, list[dict]] = {target_id: [] for target_id in checkpoint_ids}
+    reprojection: list[dict] = []
+    for camera, images in checkpoint_images.items():
+        intrinsics = state.camera_intrinsics[camera]
+        matrix = intrinsics_matrix(intrinsics)
+        distortion = distortion_vector(intrinsics)
+        for image in images:
+            stem = image.image_path.stem
+            if stem not in calibrated_frame_stems:
+                continue
+            rig_pose = state.rig_poses.get(stem)
+            if rig_pose is None:
+                continue
+            pose = compose_poses(rig_pose, state.relative_poses[camera])
+            rotation = rotation_matrix_from_pose(pose)
+            center = -rotation.T @ pose[3:]
+            for target_id, measured in image.detections.items():
+                if target_id not in checkpoint_ids:
+                    continue
+                normalized = cv2.undistortPoints(
+                    np.asarray(measured, dtype=np.float64).reshape(1, 1, 2), matrix, distortion,
+                )[0, 0]
+                direction = rotation.T @ np.array([normalized[0], normalized[1], 1.0])
+                direction /= np.linalg.norm(direction)
+                by_target[target_id].append({
+                    "camera": camera, "frame": stem, "center": center, "direction": direction,
+                    "pose": pose, "measured": np.asarray(measured, dtype=np.float64),
+                })
+                predicted = project_point(intrinsics, pose, known_targets3d[target_id])
+                delta = predicted - measured
+                reference_delta = known_targets3d[target_id] - center
+                object_error = float(np.linalg.norm(
+                    reference_delta - direction * float(reference_delta @ direction)
+                ))
+                reprojection.append({
+                    "target_id": int(target_id), "camera": camera, "frame": stem,
+                    "du_px": float(delta[0]), "dv_px": float(delta[1]),
+                    "error_px": float(np.linalg.norm(delta)),
+                    "object_error_m": object_error,
+                })
+
+    targets: list[dict] = []
+    for target_id in sorted(checkpoint_ids):
+        rays = by_target[target_id]
+        result = {"target_id": int(target_id), "n_observations": len(rays)}
+        if len(rays) < 2:
+            result.update(status="failed", reason="fewer than two posed observations")
+            targets.append(result)
+            continue
+        centers = np.asarray([item["center"] for item in rays])
+        if np.max(np.linalg.norm(centers[:, None] - centers[None, :], axis=2)) <= 1e-9:
+            result.update(status="failed", reason="observations share one optical center")
+            targets.append(result)
+            continue
+        directions = np.asarray([item["direction"] for item in rays])
+        cosines = np.clip(directions @ directions.T, -1.0, 1.0)
+        max_angle = float(np.degrees(np.max(np.arccos(cosines))))
+        identity = np.eye(3)
+        normal = sum(identity - np.outer(direction, direction) for direction in directions)
+        rhs = sum(
+            (identity - np.outer(direction, direction)) @ center
+            for direction, center in zip(directions, centers)
+        )
+        singular = np.linalg.svd(normal, compute_uv=False)
+        condition = float(singular[0] / singular[-1]) if singular[-1] > 0 else float("inf")
+        if np.linalg.matrix_rank(normal) < 3 or not np.isfinite(condition) or condition > 1e12:
+            result.update(status="failed", reason="ill-conditioned ray intersection",
+                          intersection_angle_deg=max_angle, condition_number=condition)
+            targets.append(result)
+            continue
+        reconstructed = np.linalg.solve(normal, rhs)
+        positive = all(
+            float((rotation_matrix_from_pose(item["pose"]) @ reconstructed + item["pose"][3:])[2]) > 0
+            for item in rays
+        )
+        if not positive:
+            result.update(status="failed", reason="non-positive reconstructed depth",
+                          intersection_angle_deg=max_angle, condition_number=condition)
+            targets.append(result)
+            continue
+        error = reconstructed - known_targets3d[target_id]
+        result.update(
+            status="ok", reconstructed_xyz_m=reconstructed.tolist(),
+            reference_xyz_m=known_targets3d[target_id].tolist(), error_xyz_m=error.tolist(),
+            error_3d_m=float(np.linalg.norm(error)), intersection_angle_deg=max_angle,
+            condition_number=condition, weak_geometry=bool(max_angle < 1.0),
+        )
+        targets.append(result)
+
+    successful = [item for item in targets if item["status"] == "ok"]
+    errors = np.asarray([item["error_xyz_m"] for item in successful], dtype=np.float64)
+    magnitudes = np.asarray([item["error_3d_m"] for item in successful], dtype=np.float64)
+    uv = np.asarray([[item["du_px"], item["dv_px"]] for item in reprojection], dtype=np.float64)
+    summary = {
+        "selected_targets": len(checkpoint_ids),
+        "observed_in_posed_frames": sum(bool(by_target[target_id]) for target_id in checkpoint_ids),
+        "xyz_reconstructed": len(successful),
+        "xyz_failed": len(checkpoint_ids) - len(successful),
+        "weak_geometry": sum(bool(item.get("weak_geometry")) for item in successful),
+    }
+    if errors.size:
+        summary.update(
+            mean_error_xyz_m=np.mean(errors, axis=0).tolist(),
+            std_error_xyz_m=(np.std(errors, axis=0, ddof=1) if len(errors) > 1 else np.zeros(3)).tolist(),
+            rmse_xyz_m=np.sqrt(np.mean(errors ** 2, axis=0)).tolist(),
+            rmse_3d_m=float(np.sqrt(np.mean(magnitudes ** 2))),
+            median_3d_m=float(np.median(magnitudes)), p95_3d_m=float(np.percentile(magnitudes, 95)),
+            max_3d_m=float(np.max(magnitudes)),
+        )
+    if uv.size:
+        norms = np.linalg.norm(uv, axis=1)
+        object_errors = np.asarray(
+            [item["object_error_m"] for item in reprojection], dtype=np.float64,
+        )
+        summary["withheld_reprojection"] = {
+            "n": len(uv), "mean_du_px": float(np.mean(uv[:, 0])),
+            "mean_dv_px": float(np.mean(uv[:, 1])),
+            "rms_u_px": float(np.sqrt(np.mean(uv[:, 0] ** 2))),
+            "rms_v_px": float(np.sqrt(np.mean(uv[:, 1] ** 2))),
+            "rms_2d_px": float(np.sqrt(np.mean(norms ** 2))),
+            "p95_2d_px": float(np.percentile(norms, 95)),
+            "object_space_rms_m": float(np.sqrt(np.mean(object_errors ** 2))),
+            "object_space_median_m": float(np.median(object_errors)),
+            "object_space_p95_m": float(np.percentile(object_errors, 95)),
+        }
+    return {"summary": summary, "targets": targets, "reprojection_observations": reprojection}
+
 def parse_combined_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Combined multi-camera CCT calibration: SfM initialisation → CCT detection → joint BA."
+        description="Combined multi-camera CCT calibration: SfM initialisation -> CCT detection -> joint BA."
     )
     parser.add_argument(
         "--image-root", type=Path, required=True,
@@ -1504,6 +3032,21 @@ def parse_combined_args() -> argparse.Namespace:
                         help="Re-run CCT detection even if cached detections exist.")
     parser.add_argument("--targets3d", type=Path, default=None,
                         help="TSV file with known 3D target positions: target_id x y z")
+    parser.add_argument(
+        "--checkpoints", nargs="?", type=float, const=0.2, default=0.0,
+        metavar="RATIO",
+        help="Withhold a reproducible fraction of known target IDs for independent checks. "
+             "Using the flag without RATIO selects 0.2; zero disables it.",
+    )
+    parser.add_argument(
+        "--checkpoint-seed", type=int, default=42,
+        help="Integer seed for reproducible checkpoint target selection (default: 42).",
+    )
+    parser.add_argument(
+        "--observation-sigma-px", type=float, default=None,
+        help="A-priori 1-sigma precision of each measured image coordinate, in pixels. "
+             "Enables standardized residuals and the observed-to-assumed residual variance ratio.",
+    )
     parser.add_argument("--min-detections", type=int, default=5)
     parser.add_argument("--min-shared", type=int, default=6)
     parser.add_argument("--max-reprojection-error", type=float, default=12.0)
@@ -1518,6 +3061,10 @@ def parse_combined_args() -> argparse.Namespace:
     parser.add_argument("--valid-ids-file", type=Path, default=None)
     parser.add_argument("--valid-id-max", type=int, default=None)
     parser.add_argument("--max-id-hamming-distance", type=int, default=0)
+    parser.add_argument(
+        "--no-pdf-report", action="store_true",
+        help="Skip generation of the rich PDF calibration report.",
+    )
     return parser.parse_args()
 
 
@@ -1531,6 +3078,12 @@ def main() -> int:
     args.known_baseline = baseline_vector if baseline_vector is not None else baseline_value
 
     known_targets3d = load_targets3d(args.targets3d) if args.targets3d else None
+    if not np.isfinite(args.checkpoints) or args.checkpoints < 0.0 or args.checkpoints >= 1.0:
+        print("ERROR: --checkpoints ratio must be finite and in [0, 1)", flush=True)
+        return 1
+    if args.checkpoints > 0.0 and known_targets3d is None:
+        print("ERROR: --checkpoints requires --targets3d", flush=True)
+        return 1
     if args.skip_sfm and known_targets3d is None:
         print("ERROR: --skip-sfm currently requires --targets3d", flush=True)
         return 1
@@ -1596,7 +3149,73 @@ def main() -> int:
         max_id_hamming_distance=args.max_id_hamming_distance,
         min_detections=args.min_detections,
         force=args.force_detections,
+        initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
     )
+
+    if args.checkpoints > 0.0:
+        raw_cache_complete = all(
+            image.raw_cache_verified
+            for images in detections_by_camera.values()
+            for image in images
+        )
+        if not raw_cache_complete:
+            print(
+                "  checkpoint split requires original detector coordinates; "
+                "cache is legacy/incomplete, running CCT detection once to upgrade it",
+                flush=True,
+            )
+            detections_by_camera = detect_all_cameras(
+                image_root, camera_names, output_dir,
+                valid_ids=valid_ids,
+                max_id_hamming_distance=args.max_id_hamming_distance,
+                min_detections=args.min_detections,
+                force=True,
+                initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
+            )
+        else:
+            print(
+                "  checkpoint split: reusing cached detections and restoring original "
+                "detector coordinates before calibration",
+                flush=True,
+            )
+        # Cached active coordinates may have been refined by a previous
+        # calibration that used a different target partition. Start from the
+        # immutable detector coordinates, but retain the cached ellipses so
+        # calibrated centre refinement stays inexpensive.
+        for images in detections_by_camera.values():
+            for image in images:
+                image.detections = {
+                    target_id: image.raw_detections[target_id].copy()
+                    for target_id in image.detections
+                }
+                image.refinement_status.clear()
+
+    checkpoint_images: Dict[str, List[ImageDetections]] = {}
+    checkpoint_ids: Set[int] = set()
+    checkpoint_manifest: dict | None = None
+    calibration_targets3d = known_targets3d
+    if args.checkpoints > 0.0:
+        try:
+            checkpoint_images, checkpoint_ids, checkpoint_manifest = partition_independent_checkpoints(
+                detections_by_camera, known_targets3d, args.checkpoints,
+                args.checkpoint_seed, args.min_detections,
+            )
+        except ValueError as exc:
+            print(f"ERROR: invalid checkpoint split: {exc}", flush=True)
+            return 1
+        calibration_targets3d = {
+            target_id: point for target_id, point in known_targets3d.items()
+            if target_id not in checkpoint_ids
+        }
+        (output_dir / "checkpoint_split.json").write_text(
+            json.dumps(checkpoint_manifest, indent=2), encoding="utf-8",
+        )
+        print(
+            f"independent checkpoints: {len(checkpoint_ids)}/"
+            f"{len(checkpoint_manifest['eligible_target_ids'])} eligible targets; "
+            f"seed={args.checkpoint_seed}; IDs={sorted(checkpoint_ids)}",
+            flush=True,
+        )
 
     if args.skip_sfm:
         print("=" * 60, flush=True)
@@ -1605,7 +3224,7 @@ def main() -> int:
         sfm_intrinsics, sfm_poses = bootstrap_from_known_targets(
             detections_by_camera,
             camera_names,
-            known_targets3d,
+            calibration_targets3d,
             args.min_shared,
         )
 
@@ -1617,10 +3236,21 @@ def main() -> int:
     state = initialize_multi_camera_state(
         sfm_intrinsics, sfm_poses, detections_by_camera, camera_names,
         max_reprojection_error=args.max_reprojection_error,
-        known_targets3d=known_targets3d,
+        known_targets3d=calibration_targets3d,
         known_baseline=args.known_baseline,
+        reuse_known_world_poses=args.skip_sfm,
     )
+    initial_camera_intrinsics = {
+        name: values.copy() for name, values in state.camera_intrinsics.items()
+    }
+    initial_relative_poses = {
+        name: values.copy() for name, values in state.relative_poses.items()
+    }
     fixed_point_ids: Set[int] = getattr(state, '_fixed_point_ids', set())
+    if checkpoint_ids:
+        initialization_ids = set(state.points) | set(fixed_point_ids)
+        if checkpoint_ids & initialization_ids:
+            raise RuntimeError("checkpoint leakage detected in initialized target state")
     use_known_baseline = args.known_baseline is not None
     optimize_relative_poses = bool(fixed_point_ids) or use_known_baseline
     if optimize_relative_poses:
@@ -1653,11 +3283,35 @@ def main() -> int:
         loss_patience=args.loss_patience,
         robust_loss="none",
         fix_relative_poses=not optimize_relative_poses,
-        fix_relative_pose_translations=args.known_baseline is not None,
+        fix_relative_pose_translations=baseline_vector is not None,
         fixed_point_ids=fixed_point_ids,
         known_baseline=args.known_baseline,
     )
     print(f"  first BA (plain LS): {diagnostics.summary}", flush=True)
+    bundle_history = [("Initial least-squares", diagnostics)]
+
+    center_intrinsics_history = [{name: values.tolist() for name, values in state.camera_intrinsics.items()}]
+    center_updates = refine_detected_centers_after_calibration(
+        detections_by_camera, state.camera_intrinsics,
+        valid_ids=valid_ids,
+        max_id_hamming_distance=args.max_id_hamming_distance,
+    )
+    center_update_history = [dict(center_updates)]
+    # Checkpoint newly recovered ellipse evidence immediately. If a later BA
+    # or report step is interrupted, the next run still avoids that migration
+    # work and resumes from the exact verified observations.
+    for cam_name, images in detections_by_camera.items():
+        save_refinement_cache(images, output_dir / cam_name, merge_existing=True)
+    print(
+        "  calibrated centre remeasurement: "
+        + ", ".join(f"{name}={count}" for name, count in center_updates.items()),
+        flush=True,
+    )
+    observations = multi_cam_collect_observations(
+        detections_by_camera, state, None,
+    )
+    if checkpoint_ids & {int(target_id) for _, _, target_id, _ in observations}:
+        raise RuntimeError("checkpoint leakage detected in bundle observations")
 
     wide_observations = multi_cam_collect_observations(
         detections_by_camera, state, args.max_reprojection_error * 3.0,
@@ -1680,13 +3334,20 @@ def main() -> int:
         robust_loss="cauchy",
         cauchy_scale=3.0,
         fix_relative_poses=not optimize_relative_poses,
-        fix_relative_pose_translations=args.known_baseline is not None,
+        fix_relative_pose_translations=baseline_vector is not None,
         fix_intrinsics=True,
         fixed_point_ids=fixed_point_ids,
         known_baseline=args.known_baseline,
     )
     print(f"  robust BA (Cauchy, intrinsics fixed): {diagnostics.summary}", flush=True)
+    bundle_history.append(("Robust Cauchy (intrinsics fixed)", diagnostics))
 
+    prefilter_reprojection_by_camera = {
+        cam_name: multi_cam_compute_reprojection_errors(
+            state, [item for item in wide_observations if item[0] == cam_name],
+        )
+        for cam_name in camera_names
+    }
     observations, filter_stats = multi_cam_filter_inlier_observations(
         state, wide_observations, args.outlier_mad_scale,
     )
@@ -1714,11 +3375,113 @@ def main() -> int:
         loss_patience=args.loss_patience,
         robust_loss="none",
         fix_relative_poses=not optimize_relative_poses,
-        fix_relative_pose_translations=args.known_baseline is not None,
+        fix_relative_pose_translations=baseline_vector is not None,
         fixed_point_ids=fixed_point_ids,
         known_baseline=args.known_baseline,
+        collect_adjustment_diagnostics=True,
+        initial_camera_intrinsics=initial_camera_intrinsics,
+        initial_relative_poses=initial_relative_poses,
+        observation_sigma_px=args.observation_sigma_px,
     )
     print(f"  final BA (plain LS): {diagnostics.summary}", flush=True)
+    bundle_history.append(("Post-filter least-squares", diagnostics))
+
+    # Refresh centres once more only when the preceding BA changed the camera
+    # model enough to matter in image space. This is a bounded two-pass
+    # refinement, not a verified fixed-point convergence.
+    # Preserve the robust-filter
+    # selection by key (camera, frame, target), then perform one final BA on
+    # the refreshed coordinates.  A second pass is intentionally the endpoint
+    # so the report can state exactly how many conditional remeasurements ran.
+    center_intrinsics_history.append({name: values.tolist() for name, values in state.camera_intrinsics.items()})
+    final_center_updates = refine_detected_centers_after_calibration(
+        detections_by_camera, state.camera_intrinsics,
+        valid_ids=valid_ids,
+        max_id_hamming_distance=args.max_id_hamming_distance,
+    )
+    center_update_history.append(dict(final_center_updates))
+    if sum(final_center_updates.values()) > 0:
+        retained_keys = {(cam, stem, int(target_id)) for cam, stem, target_id, _ in observations}
+        refreshed = multi_cam_collect_observations(detections_by_camera, state, None)
+        observations = [
+            item for item in refreshed
+            if (item[0], item[1], int(item[2])) in retained_keys
+        ]
+        diagnostics = solve_multi_cam_bundle_adjustment(
+            state, observations,
+            max_iterations=args.max_iterations,
+            huber_delta=args.huber_delta,
+            loss_relative_tolerance=args.loss_tolerance,
+            loss_patience=args.loss_patience,
+            robust_loss="none",
+            fix_relative_poses=not optimize_relative_poses,
+            fix_relative_pose_translations=baseline_vector is not None,
+            fixed_point_ids=fixed_point_ids,
+            known_baseline=args.known_baseline,
+            collect_adjustment_diagnostics=True,
+            initial_camera_intrinsics=initial_camera_intrinsics,
+            initial_relative_poses=initial_relative_poses,
+            observation_sigma_px=args.observation_sigma_px,
+        )
+        print(f"  final BA after calibrated centre pass: {diagnostics.summary}", flush=True)
+        bundle_history.append(("After centre refinement", diagnostics))
+
+    # Persist the exact image measurements used by the final adjustment.  A
+    # subsequent cached run must not silently fall back to the provisional
+    # ellipse centres that preceded calibrated remeasurement, but frames
+    # rejected by the current threshold remain in the cache.
+    _persist_refined_detection_cache(detections_by_camera, output_dir)
+
+    checkpoint_quality: dict | None = None
+    if checkpoint_ids:
+        print("  evaluating withheld checkpoints with the final calibration frozen", flush=True)
+        calibrated_frame_stems = {stem for _, stem, _, _ in observations}
+        posed_checkpoint_images = {
+            camera: [image for image in images if image.image_path.stem in calibrated_frame_stems]
+            for camera, images in checkpoint_images.items()
+        }
+        refine_detected_centers_after_calibration(
+            posed_checkpoint_images, state.camera_intrinsics,
+            valid_ids=valid_ids,
+            max_id_hamming_distance=args.max_id_hamming_distance,
+        )
+        for camera, images in posed_checkpoint_images.items():
+            save_refinement_cache(images, output_dir / camera, merge_existing=True)
+        checkpoint_quality = evaluate_independent_checkpoints(
+            state, posed_checkpoint_images, checkpoint_ids, known_targets3d,
+            calibrated_frame_stems,
+        )
+        checkpoint_quality["split"] = checkpoint_manifest
+        (output_dir / "checkpoint_quality.json").write_text(
+            json.dumps(checkpoint_quality, indent=2), encoding="utf-8",
+        )
+        summary = checkpoint_quality["summary"]
+        print(
+            f"  checkpoint XYZ: {summary['xyz_reconstructed']}/{summary['selected_targets']} "
+            f"reconstructed; 3D RMSE="
+            f"{summary.get('rmse_3d_m', float('nan')) * 1000.0:.3f} mm",
+            flush=True,
+        )
+
+    (output_dir / "center_remeasurement.json").write_text(
+        json.dumps({
+            "passes": [
+                {"pass": index + 1, "changed_by_camera": values,
+                 "intrinsics_used": center_intrinsics_history[index]}
+                for index, values in enumerate(center_update_history)
+            ],
+            "method": "calibrated-concentric-conic",
+            "conditional_on_current_intrinsics": True,
+            "intrinsics_source": "preceding bundle adjustment, as recorded for each pass",
+            "convergence_verified": False,
+            "center_localization_covariance_available": False,
+            "final_retained_observations": [
+                {"camera": camera, "frame": frame, "target_id": int(target_id),
+                 "u_px": float(point[0]), "v_px": float(point[1])}
+                for camera, frame, target_id, point in observations
+            ],
+        }, indent=2), encoding="utf-8",
+    )
 
     # ── Results ──────────────────────────────────────────────────
     print("=" * 60, flush=True)
@@ -1770,6 +3533,67 @@ def main() -> int:
             "tvec": rp[3:].tolist(),
         }
     overall["relative_poses"] = rel_poses_out
+    if checkpoint_quality is not None:
+        overall["independent_checkpoint_quality"] = checkpoint_quality
+
+    if diagnostics.adjustment is not None:
+        adjustment = diagnostics.adjustment
+        diagonal = np.diag(adjustment.covariance)
+        def _json_number(value: float) -> float | None:
+            return float(value) if np.isfinite(value) else None
+
+        def _json_matrix(matrix: np.ndarray) -> list[list[float | None]]:
+            return [
+                [_json_number(float(value)) for value in row]
+                for row in np.asarray(matrix)
+            ]
+
+        overall["adjustment_quality"] = {
+            "dof": adjustment.dof,
+            "jacobian_rows": adjustment.jacobian_rows,
+            "jacobian_columns": adjustment.jacobian_columns,
+            "numerical_rank": adjustment.numerical_rank,
+            "rank_tolerance": _json_number(adjustment.rank_tolerance or float("nan")),
+            "rank_verified": adjustment.rank_verified,
+            "nullity": adjustment.nullity,
+            "sigma0_px": _json_number(adjustment.sigma0_px),
+            "variance_factor_px2": _json_number(adjustment.variance_factor),
+            "observation_sigma_px": _json_number(adjustment.observation_sigma_px) if adjustment.observation_sigma_px is not None else None,
+            "residual_variance_ratio_observed_to_assumed": (
+                _json_number(adjustment.variance_factor / adjustment.observation_sigma_px ** 2)
+                if adjustment.observation_sigma_px is not None and adjustment.observation_sigma_px > 0
+                else None
+            ),
+            "residual_variance_interpretation": (
+                ("below_assumed_conservative_sigma"
+                 if adjustment.variance_factor / adjustment.observation_sigma_px ** 2 <= 1.0
+                 else "above_assumed_investigate")
+                if adjustment.observation_sigma_px is not None and adjustment.observation_sigma_px > 0
+                else "unavailable_without_apriori_sigma"
+            ),
+            "correlation_condition_number": _json_number(adjustment.condition_number),
+            "covariance_method": adjustment.covariance_method,
+            "parameters": [
+                {
+                    "name": name,
+                    "initial": float(adjustment.parameter_initial[index]),
+                    "final": float(adjustment.parameter_final[index]),
+                    "stddev": (
+                        float(np.sqrt(diagonal[index]))
+                        if np.isfinite(diagonal[index]) and diagonal[index] >= 0 else None
+                    ),
+                    "status": adjustment.parameter_status[index],
+                }
+                for index, name in enumerate(adjustment.parameter_names)
+            ],
+            "covariance": _json_matrix(adjustment.covariance),
+            "correlation": _json_matrix(adjustment.correlation),
+            "weakest_singular_values": (
+                [_json_number(float(v)) for v in adjustment.weakest_singular_values]
+                if adjustment.weakest_singular_values is not None else None
+            ),
+            "warnings": adjustment.warnings,
+        }
 
     summary_path = output_dir / "combined_summary.json"
     summary_path.write_text(json.dumps(overall, indent=2), encoding="utf-8")
@@ -1789,6 +3613,71 @@ def main() -> int:
     # Save Kalibr camchain
     kalibr_path = save_kalibr_camchain(state, detections_by_camera, output_dir)
     print(f"Kalibr camchain: {kalibr_path}", flush=True)
+
+    # ── Rich PDF report ──────────────────────────────────────────
+    if not args.no_pdf_report:
+        try:
+            from cct_calibration.reporting import (
+                build_multi_camera_report_data,
+                generate_pdf_report,
+            )
+
+            meta = {"Image root": str(image_root)}
+            if args.targets3d is not None:
+                meta["Known 3-D targets"] = str(args.targets3d)
+            if baseline_value is not None:
+                meta["Known baseline"] = f"{baseline_value} m"
+            elif baseline_vector is not None:
+                meta["Known baseline vector"] = "[" + ", ".join(f"{float(v):.6g}" for v in baseline_vector) + "] m"
+            if args.observation_sigma_px is not None:
+                meta["A-priori image sigma"] = f"{args.observation_sigma_px:.4g} px per coordinate"
+            if checkpoint_manifest is not None:
+                meta["Independent checkpoints"] = (
+                    f"{len(checkpoint_ids)} targets; requested ratio {args.checkpoints:.4g}; "
+                    f"seed {args.checkpoint_seed}"
+                )
+            meta["Calibrated centre remeasurement"] = "; ".join(
+                f"pass {index + 1}: " + ", ".join(f"{name}={count}" for name, count in values.items())
+                for index, values in enumerate(center_update_history)
+            )
+            meta["Centre refinement method"] = (
+                "Concentric conics conditional on preceding-BA intrinsics; "
+                "up to two passes, with the second pass reusing cached coordinates when "
+                "the camera-model change is below 0.02 px at p95 and 0.05 px maximum. "
+                "Counts are changed coordinates."
+            )
+            meta["Centre uncertainty"] = (
+                "Localisation covariance unavailable; adjustment uncertainty is conditional "
+                "on the final frozen image measurements."
+            )
+
+            def observation_key(item):
+                cam_name, stem, target_id, point = item
+                return cam_name, stem, int(target_id)
+
+            kept_keys = {observation_key(item) for item in observations}
+            rejected_observations = [
+                item for item in wide_observations
+                if observation_key(item) not in kept_keys
+            ]
+
+            report_data = build_multi_camera_report_data(
+                state, observations, detections_by_camera, diagnostics,
+                filter_stats=filter_stats,
+                known_targets3d_ids=fixed_point_ids,
+                known_baseline=baseline_value,
+                rejected_observations=rejected_observations,
+                prefilter_reprojection_by_camera=prefilter_reprojection_by_camera,
+                checkpoint_quality=checkpoint_quality,
+                bundle_history=bundle_history,
+                meta=meta,
+            )
+            pdf_path = generate_pdf_report(
+                report_data, output_dir / "calibration_report.pdf",
+            )
+            print(f"PDF report: {pdf_path}", flush=True)
+        except Exception as exc:  # reporting must never break the pipeline
+            print(f"WARNING: PDF report generation failed: {exc}", flush=True)
 
     return 0
 

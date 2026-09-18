@@ -4,9 +4,9 @@ import argparse
 import csv
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Sequence, Set
+from typing import Any, Dict, List, Sequence, Set
 
 import cv2
 import matplotlib.pyplot as plt
@@ -27,6 +27,12 @@ class ImageDetections:
     width: int
     height: int
     detections: Dict[int, np.ndarray]
+    # Immutable measurement/provenance used by calibrated centre refinement.
+    # Legacy four-column caches leave these empty and are upgraded lazily.
+    raw_detections: Dict[int, np.ndarray] = field(default_factory=dict)
+    refinement_ellipses: Dict[int, tuple] = field(default_factory=dict)
+    refinement_status: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    raw_cache_verified: bool = False
 
 
 @dataclass
@@ -73,6 +79,7 @@ class SolverDiagnostics:
     initial_cost: float
     final_cost: float
     cost_history: List[float]
+    adjustment: Any | None = None
 
 
 @dataclass
@@ -305,6 +312,137 @@ def save_annotated_detection_image(output_path: Path, image: np.ndarray) -> None
         raise RuntimeError(f"Failed to save annotated detection image to {output_path}")
 
 
+REFINEMENT_CACHE_SCHEMA = 1
+REFINEMENT_CACHE_NAME = "target_refinement_cache.json"
+
+
+def _image_freshness(path: Path) -> Dict[str, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def load_refinement_cache(
+    images: Sequence[ImageDetections],
+    camera_output_dir: Path,
+) -> int:
+    """Attach versioned raw-centre/ellipse evidence to cached observations."""
+    # Always establish the legacy fallback, including when a companion cache
+    # exists but is unreadable or from a newer schema.
+    for image in images:
+        image.raw_detections = {
+            int(target_id): np.asarray(point, dtype=np.float64).copy()
+            for target_id, point in image.detections.items()
+        }
+    path = camera_output_dir / REFINEMENT_CACHE_NAME
+    if not path.exists():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return 0
+    if payload.get("schema_version") != REFINEMENT_CACHE_SCHEMA:
+        return 0
+    records = payload.get("images", {})
+    attached = 0
+    for image in images:
+        cached = records.get(image.image_path.name)
+        if not isinstance(cached, dict):
+            continue
+        if cached.get("freshness") != _image_freshness(image.image_path):
+            continue
+        if [image.width, image.height] != cached.get("image_size"):
+            continue
+        valid_raw_ids: set[int] = set()
+        for target_text, item in cached.get("observations", {}).items():
+            try:
+                target_id = int(target_text)
+                if target_id not in image.detections:
+                    continue
+                raw = np.asarray(item["raw_center"], dtype=np.float64)
+                ellipse_values = item.get("ellipse")
+                if raw.shape != (2,) or not np.all(np.isfinite(raw)):
+                    continue
+                image.raw_detections[target_id] = raw
+                valid_raw_ids.add(target_id)
+                if ellipse_values is not None and len(ellipse_values) == 5:
+                    cx, cy, width, height, angle = map(float, ellipse_values)
+                    if np.all(np.isfinite([cx, cy, width, height, angle])) and min(width, height) > 0:
+                        image.refinement_ellipses[target_id] = (
+                            (cx, cy), (width, height), angle,
+                        )
+                status = item.get("refinement")
+                if isinstance(status, dict):
+                    image.refinement_status[target_id] = dict(status)
+                attached += int(target_id in image.refinement_ellipses)
+            except (KeyError, TypeError, ValueError):
+                continue
+        image.raw_cache_verified = set(image.detections).issubset(valid_raw_ids)
+    return attached
+
+
+def save_refinement_cache(
+    images: Sequence[ImageDetections],
+    camera_output_dir: Path,
+    *,
+    merge_existing: bool = False,
+) -> Path:
+    """Atomically persist immutable measurements and reusable ellipse evidence."""
+    path = camera_output_dir / REFINEMENT_CACHE_NAME
+    previous_images: Dict[str, Any] = {}
+    if merge_existing and path.exists():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if previous.get("schema_version") == REFINEMENT_CACHE_SCHEMA:
+                previous_images = dict(previous.get("images", {}))
+        except (OSError, ValueError, TypeError):
+            previous_images = {}
+    for image in images:
+        observations: Dict[str, Any] = {}
+        for target_id, active in sorted(image.detections.items()):
+            raw = image.raw_detections.get(target_id, active)
+            ellipse = image.refinement_ellipses.get(target_id)
+            ellipse_values = None
+            if ellipse is not None:
+                ellipse_values = [
+                    float(ellipse[0][0]), float(ellipse[0][1]),
+                    float(ellipse[1][0]), float(ellipse[1][1]), float(ellipse[2]),
+                ]
+            observations[str(int(target_id))] = {
+                "raw_center": [float(raw[0]), float(raw[1])],
+                "active_center": [float(active[0]), float(active[1])],
+                "ellipse": ellipse_values,
+                "refinement": dict(image.refinement_status.get(target_id, {})),
+            }
+        image_record = {
+            "image_size": [int(image.width), int(image.height)],
+            "freshness": _image_freshness(image.image_path),
+            "observations": observations,
+        }
+        previous_record = previous_images.get(image.image_path.name)
+        if (
+            merge_existing and isinstance(previous_record, dict)
+            and previous_record.get("image_size") == image_record["image_size"]
+            and previous_record.get("freshness") == image_record["freshness"]
+        ):
+            merged_observations = dict(previous_record.get("observations", {}))
+            merged_observations.update(observations)
+            image_record["observations"] = merged_observations
+        previous_images[image.image_path.name] = image_record
+    payload = {
+        "schema_version": REFINEMENT_CACHE_SCHEMA,
+        "centre_estimator": "calibrated-concentric-conic-v1",
+        "images": previous_images,
+    }
+    camera_output_dir.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
 def save_target_detections(
     images: Sequence[ImageDetections],
     camera_name: str,
@@ -321,6 +459,7 @@ def save_target_detections(
                 f"{image.image_path.name}\t{int(target_id)}\t{float(point[0]):.6f}\t{float(point[1]):.6f}"
             )
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    save_refinement_cache(images, camera_output_dir)
     return output_path
 
 
@@ -373,7 +512,12 @@ def load_cached_detections(
             )
         )
 
-    print(f"loaded {len(result)} images from cache: {cache_path}", flush=True)
+    evidence_count = load_refinement_cache(result, cache_path.parent)
+    print(
+        f"loaded {len(result)} images from cache: {cache_path} "
+        f"({evidence_count} detections ready for centre refinement)",
+        flush=True,
+    )
     return result
 
 
@@ -415,10 +559,12 @@ def _load_detections_cct_detect(
     detections_output_dir: Path | None,
     valid_ids: Set[int] | None,
     max_id_hamming_distance: int,
+    initial_intrinsics: np.ndarray | None = None,
 ) -> List[ImageDetections]:
     """Detection path using the modern cct_detect detector with affine rectification."""
     detector = _CCTDetector(n_bits=14)
     kept: List[ImageDetections] = []
+    production_diagnostics: list[dict[str, Any]] = []
     expected_size: tuple[int, int] | None = None
     for image_index, image_path in enumerate(image_paths):
         image = cv2.imread(str(image_path))
@@ -432,14 +578,31 @@ def _load_detections_cct_detect(
                 f"Image size mismatch for {image_path}: {(width, height)} != {expected_size}"
             )
 
-        detections = detector.detect(image)
+        if hasattr(detector, "detect_with_diagnostics"):
+            detections, detector_diag = detector.detect_with_diagnostics(image, intrinsics=initial_intrinsics)
+        else:
+            detections = detector.detect(image)
+            detector_diag = None
 
         grouped: Dict[int, List[np.ndarray]] = {}
+        grouped_records: Dict[int, List[Any]] = {}
+        accepted_for_annotation = []
+        rejected_ids = 0
+        corrected_ids = 0
         for det in detections:
             raw_id = det.target_id
             target_id, corrected = normalize_target_id(raw_id, valid_ids, max_id_hamming_distance)
             if target_id is None:
+                rejected_ids += 1
                 continue
+            corrected_ids += int(corrected)
+            # Do not draw raw decoder IDs that are rejected by the configured
+            # target codebook/range.  The production overlay must show the
+            # same observations that can enter calibration; when a permitted
+            # Hamming correction is used, display the corrected ID.
+            accepted = replace(det, target_id=int(target_id))
+            accepted_for_annotation.append(accepted)
+            grouped_records.setdefault(target_id, []).append(accepted)
             grouped.setdefault(target_id, []).append(
                 np.array([det.center[0], det.center[1]], dtype=np.float64)
             )
@@ -451,11 +614,41 @@ def _load_detections_cct_detect(
             if merged is not None:
                 unique_detections[target_id] = merged
 
+        if detector_diag is not None:
+            production_diagnostics.append({
+                "image": image_path.name,
+                "counts": dict(detector_diag.counts),
+                "valid_id_rejections": int(rejected_ids),
+                "hamming_corrections": int(corrected_ids),
+                "duplicate_id_groups": int(max(0, len(grouped) - len(unique_detections))),
+                "rejected": list(getattr(detector_diag, "rejected", [])),
+            })
+
         if detections_output_dir is not None:
-            annotated = detector.annotate(image, detections)
+            annotated = detector.annotate(image, accepted_for_annotation)
             save_annotated_detection_image(detections_output_dir / image_path.name, annotated)
 
         if unique_detections:
+            raw_detections: Dict[int, np.ndarray] = {}
+            refinement_ellipses: Dict[int, tuple] = {}
+            refinement_status: Dict[int, Dict[str, Any]] = {}
+            for target_id in unique_detections:
+                candidates = grouped_records.get(target_id, [])
+                if len(candidates) != 1:
+                    continue
+                detection = candidates[0]
+                ellipse_center = detection.ellipse_center or detection.ellipse[0]
+                raw_detections[target_id] = np.asarray(ellipse_center, dtype=np.float64)
+                refinement_ellipses[target_id] = detection.ellipse
+                refinement_status[target_id] = {
+                    "method": detection.center_method,
+                    "intrinsics": (
+                        [float(value) for value in initial_intrinsics]
+                        if initial_intrinsics is not None and detection.center_method != "ellipse"
+                        else None
+                    ),
+                    "reason": "verified during production detection",
+                }
             kept.append(
                 ImageDetections(
                     image_path=image_path,
@@ -463,6 +656,10 @@ def _load_detections_cct_detect(
                     width=width,
                     height=height,
                     detections=unique_detections,
+                    raw_detections=raw_detections,
+                    refinement_ellipses=refinement_ellipses,
+                    refinement_status=refinement_status,
+                    raw_cache_verified=True,
                 )
             )
 
@@ -472,6 +669,11 @@ def _load_detections_cct_detect(
                 flush=True,
             )
 
+    if detections_output_dir is not None and production_diagnostics:
+        detections_output_dir.mkdir(parents=True, exist_ok=True)
+        (detections_output_dir / "detection_diagnostics.json").write_text(
+            json.dumps(production_diagnostics, indent=2), encoding="utf-8",
+        )
     return kept
 
 
@@ -480,12 +682,14 @@ def load_image_detections(
     detections_output_dir: Path | None = None,
     valid_ids: Set[int] | None = None,
     max_id_hamming_distance: int = 0,
+    initial_intrinsics: np.ndarray | None = None,
 ) -> List[ImageDetections]:
     return _load_detections_cct_detect(
         image_paths,
         detections_output_dir,
         valid_ids,
         max_id_hamming_distance,
+        initial_intrinsics,
     )
 
 
@@ -717,6 +921,7 @@ def initialize_known_target_state(
         initial_camera_matrix,
         initial_dist_coeffs,
         flags=cv2.CALIB_FIX_K3 | cv2.CALIB_USE_INTRINSIC_GUESS,
+        criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 30, 1e-6),
     )
     dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
 
