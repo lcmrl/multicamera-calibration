@@ -72,6 +72,10 @@ Supported input formats are:
 
 When `--targets3d` is provided, the pipeline can use those known coordinates to anchor the solution to a metric frame.
 
+The reference file also defines the codebook: target IDs are then decoded by correlating the code ring with each valid code (all rotations), which recovers targets the generic decoder misses, including single-arc codes. Without `--targets3d` the generic decoder is used, unchanged (`--valid-ids-file` / `--valid-id-max` then only filter the decoded IDs).
+
+Detection caches are stamped with the detector version; a cache from an older detector is reused with a warning, so pass `--force-detections` after a detector update.
+
 ## Quick start
 
 ### 1. Multi-camera calibration
@@ -165,6 +169,10 @@ This runs detection only and exports the detections without performing pose init
 - `--valid-ids-file`: optional file listing valid target IDs.
 - `--valid-id-max`: use all target IDs from `0` to `N` as valid.
 - `--max-id-hamming-distance`: allow decoded target IDs to be snapped to the nearest valid ID only within this Hamming-distance limit.
+
+### Developer diagnostics
+
+- `--evaluate-detections` (off by default, requires `--targets3d`): projects every reference target with the final calibration, reports per-camera detection recall and detections far from the projection of their ID, and attributes each miss to the detector stage that rejected it (`detection_evaluation.json`). It re-runs detection on images with misses, so it is slow; it is a consistency tool for detector development, not independent ground truth.
 
 ### Single-camera flags
 

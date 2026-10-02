@@ -17,7 +17,11 @@ try:
 except ModuleNotFoundError:
     rr = None
 
-from cct_detect.detector import CCTDetector as _CCTDetector
+from cct_detect.detector import (
+    DETECTOR_VERSION,
+    CCTDetector as _CCTDetector,
+    cyclic_hamming_distance,
+)
 
 
 @dataclass
@@ -146,17 +150,27 @@ def load_targets3d(path: Path) -> Dict[int, np.ndarray]:
     return targets
 
 
-def normalize_target_id(raw_id: int, valid_ids: Set[int] | None, max_hamming_distance: int) -> tuple[int | None, bool]:
+def normalize_target_id(
+    raw_id: int,
+    valid_ids: Set[int] | None,
+    max_hamming_distance: int,
+    n_bits: int = 14,
+) -> tuple[int | None, bool]:
     if valid_ids is None:
         return raw_id, False
     if raw_id in valid_ids:
         return raw_id, False
+    if max_hamming_distance <= 0:
+        return None, False
 
+    # Decoded IDs are canonical (minimum-rotation) ring codes, so the code
+    # distance must be minimised over rotations; a plain XOR of two canonical
+    # forms is not the physical bit-error count.
     best_id: int | None = None
     best_distance: int | None = None
     is_ambiguous = False
     for candidate in valid_ids:
-        distance = (raw_id ^ candidate).bit_count()
+        distance = cyclic_hamming_distance(int(raw_id), int(candidate), n_bits)
         if best_distance is None or distance < best_distance:
             best_id = candidate
             best_distance = distance
@@ -345,6 +359,14 @@ def load_refinement_cache(
         return 0
     if payload.get("schema_version") != REFINEMENT_CACHE_SCHEMA:
         return 0
+    cached_version = payload.get("detector_version")
+    if cached_version != DETECTOR_VERSION:
+        print(
+            f"  warning: cached detections in {camera_output_dir} were produced by detector "
+            f"version {cached_version or 'unknown (pre-versioning)'}; the current detector is "
+            f"{DETECTOR_VERSION}. Use --force-detections to redetect.",
+            flush=True,
+        )
     records = payload.get("images", {})
     attached = 0
     for image in images:
@@ -392,11 +414,16 @@ def save_refinement_cache(
     """Atomically persist immutable measurements and reusable ellipse evidence."""
     path = camera_output_dir / REFINEMENT_CACHE_NAME
     previous_images: Dict[str, Any] = {}
+    # A fresh write follows a detection run with the current detector.  A
+    # merge only updates refinement evidence of already cached detections, so
+    # it keeps the version of the detector that produced them.
+    detector_version: str | None = None if merge_existing else DETECTOR_VERSION
     if merge_existing and path.exists():
         try:
             previous = json.loads(path.read_text(encoding="utf-8"))
             if previous.get("schema_version") == REFINEMENT_CACHE_SCHEMA:
                 previous_images = dict(previous.get("images", {}))
+                detector_version = previous.get("detector_version")
         except (OSError, ValueError, TypeError):
             previous_images = {}
     for image in images:
@@ -434,6 +461,7 @@ def save_refinement_cache(
     payload = {
         "schema_version": REFINEMENT_CACHE_SCHEMA,
         "centre_estimator": "calibrated-concentric-conic-v1",
+        "detector_version": detector_version,
         "images": previous_images,
     }
     camera_output_dir.mkdir(parents=True, exist_ok=True)
@@ -560,9 +588,15 @@ def _load_detections_cct_detect(
     valid_ids: Set[int] | None,
     max_id_hamming_distance: int,
     initial_intrinsics: np.ndarray | None = None,
+    codebook: Set[int] | None = None,
 ) -> List[ImageDetections]:
-    """Detection path using the modern cct_detect detector with affine rectification."""
-    detector = _CCTDetector(n_bits=14)
+    """Detection path using the modern cct_detect detector with affine rectification.
+
+    ``codebook`` (the valid target IDs, known when reference coordinates are
+    supplied) switches the decoder to correlation against those codes;
+    without it the generic decoder is used.
+    """
+    detector = _CCTDetector(n_bits=14, codebook=codebook)
     kept: List[ImageDetections] = []
     production_diagnostics: list[dict[str, Any]] = []
     expected_size: tuple[int, int] | None = None
@@ -683,6 +717,7 @@ def load_image_detections(
     valid_ids: Set[int] | None = None,
     max_id_hamming_distance: int = 0,
     initial_intrinsics: np.ndarray | None = None,
+    codebook: Set[int] | None = None,
 ) -> List[ImageDetections]:
     return _load_detections_cct_detect(
         image_paths,
@@ -690,6 +725,7 @@ def load_image_detections(
         valid_ids,
         max_id_hamming_distance,
         initial_intrinsics,
+        codebook=codebook,
     )
 
 
@@ -871,6 +907,165 @@ def choose_seed_state(images: Sequence[ImageDetections], min_shared: int) -> Cal
     return best_state
 
 
+def _screened_focal_initialization(
+    object_points_list: List[np.ndarray],
+    image_points_list: List[np.ndarray],
+    width: int,
+    height: int,
+) -> tuple[float, List[np.ndarray], List[np.ndarray]]:
+    """Starting focal length for calibrateCamera, plus outlier-screened points.
+
+    A log-spaced focal scan scores each candidate by the median over frames of
+    the per-frame median PnP reprojection error (pinhole, principal point at
+    the image centre).  Medians make the score insensitive to the few
+    misidentified targets.  At the chosen focal length, correspondences far
+    beyond their frame's typical error are dropped; the threshold is lenient
+    because unmodelled lens distortion alone can reach tens of pixels at the
+    edge of a wide-angle image.  Frames left with fewer than six points keep
+    their original correspondences.
+    """
+    size = float(max(width, height))
+
+    def frame_errors(focal: float, object_points: np.ndarray, image_points: np.ndarray):
+        matrix = np.array([[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]])
+        objects = object_points.reshape(-1, 3).astype(np.float64)
+        pixels = image_points.reshape(-1, 2).astype(np.float64)
+        try:
+            ok, rvec, tvec, _ = cv2.solvePnPRansac(
+                objects, pixels, matrix, None, flags=cv2.SOLVEPNP_EPNP,
+                reprojectionError=max(8.0, 0.01 * size), iterationsCount=100,
+            )
+            if not ok:
+                return None
+            ok, rvec, tvec = cv2.solvePnP(objects, pixels, matrix, None, rvec, tvec,
+                                          useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+        except cv2.error:
+            return None
+        if not ok:
+            return None
+        projected = cv2.projectPoints(objects, rvec, tvec, matrix, None)[0].reshape(-1, 2)
+        errors = np.linalg.norm(projected - pixels, axis=1)
+        return errors if np.all(np.isfinite(errors)) else None
+
+    best_focal, best_score = size, float("inf")
+    for focal in size * np.geomspace(0.15, 2.0, 25):
+        medians = []
+        for object_points, image_points in zip(object_points_list, image_points_list):
+            errors = frame_errors(float(focal), object_points, image_points)
+            medians.append(float(np.median(errors)) if errors is not None else float("inf"))
+        score = float(np.median(medians))
+        if score < best_score:
+            best_focal, best_score = float(focal), score
+    if not np.isfinite(best_score):
+        return size, object_points_list, image_points_list
+
+    screened_objects: List[np.ndarray] = []
+    screened_images: List[np.ndarray] = []
+    for object_points, image_points in zip(object_points_list, image_points_list):
+        errors = frame_errors(best_focal, object_points, image_points)
+        if errors is not None:
+            keep = errors <= max(25.0, 4.0 * float(np.median(errors)))
+            if np.count_nonzero(keep) >= 6:
+                object_points, image_points = object_points[keep], image_points[keep]
+        screened_objects.append(object_points)
+        screened_images.append(image_points)
+    return best_focal, screened_objects, screened_images
+
+
+def _robust_intrinsic_adjustment(
+    object_points_list: List[np.ndarray],
+    image_points_list: List[np.ndarray],
+    width: int,
+    height: int,
+    initial_focal: float,
+) -> tuple[float, np.ndarray, List[np.ndarray | None]]:
+    """Huber-robust fit of OPENCV-8 intrinsics and view poses to known targets.
+
+    Views are initialised by PnP at ``initial_focal``.  A pinhole stage
+    (distortion held at zero) precedes the full fit so that the distortion
+    terms start from a sensible focal length and principal point.  Bounds
+    match the bundle adjustment.  Returns the per-point RMS reprojection
+    error (pixels), the intrinsics and one pose per input view (None when the
+    view could not be posed).
+    """
+    from scipy.optimize import least_squares
+    from scipy.sparse import lil_matrix
+
+    size = float(max(width, height))
+    focal = float(np.clip(initial_focal, 0.21 * size, 2.9 * size))
+    objects = [np.asarray(o, dtype=np.float64).reshape(-1, 3) for o in object_points_list]
+    pixels = [np.asarray(p, dtype=np.float64).reshape(-1, 2) for p in image_points_list]
+    matrix = np.array([[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]])
+
+    initial_poses: List[np.ndarray | None] = []
+    for obj, pix in zip(objects, pixels):
+        pose = None
+        try:
+            ok, rvec, tvec, _ = cv2.solvePnPRansac(
+                obj, pix, matrix, None, flags=cv2.SOLVEPNP_EPNP,
+                reprojectionError=max(8.0, 0.01 * size), iterationsCount=100,
+            )
+            if ok:
+                ok, rvec, tvec = cv2.solvePnP(obj, pix, matrix, None, rvec, tvec,
+                                              useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+            if ok:
+                pose = np.concatenate([rvec.reshape(3), tvec.reshape(3)]).astype(np.float64)
+        except cv2.error:
+            pose = None
+        initial_poses.append(pose)
+    active = [index for index, pose in enumerate(initial_poses) if pose is not None]
+    intrinsics = np.array([focal, focal, width / 2.0, height / 2.0, 0.0, 0.0, 0.0, 0.0])
+    if len(active) < 2:
+        return float("inf"), intrinsics, [None] * len(objects)
+
+    lower_all = np.array([0.2 * size, 0.2 * size, 0.25 * width, 0.25 * height, -1.0, -1.0, -1.0, -1.0])
+    upper_all = np.array([3.0 * size, 3.0 * size, 0.75 * width, 0.75 * height, 1.0, 1.0, 1.0, 1.0])
+    poses = np.array([initial_poses[index] for index in active])
+    row_counts = [2 * len(objects[index]) for index in active]
+
+    def evaluate(intr: np.ndarray, pose_block: np.ndarray) -> np.ndarray:
+        camera = np.array([[intr[0], 0.0, intr[2]], [0.0, intr[1], intr[3]], [0.0, 0.0, 1.0]])
+        out = []
+        for slot, index in enumerate(active):
+            projected = cv2.projectPoints(objects[index], pose_block[slot, :3], pose_block[slot, 3:],
+                                          camera, intr[4:8])[0].reshape(-1, 2)
+            out.append((projected - pixels[index]).reshape(-1))
+        return np.concatenate(out)
+
+    for free in (np.arange(4), np.arange(8)):
+        def unpack(x: np.ndarray):
+            intr = intrinsics.copy()
+            intr[free] = x[:free.size]
+            return intr, x[free.size:].reshape(-1, 6)
+
+        x0 = np.concatenate([intrinsics[free], poses.reshape(-1)])
+        sparsity = lil_matrix((sum(row_counts), x0.size), dtype=int)
+        row = 0
+        for slot, count in enumerate(row_counts):
+            sparsity[row:row + count, :free.size] = 1
+            start = free.size + 6 * slot
+            sparsity[row:row + count, start:start + 6] = 1
+            row += count
+        lower = np.concatenate([lower_all[free], np.full(poses.size, -np.inf)])
+        upper = np.concatenate([upper_all[free], np.full(poses.size, np.inf)])
+        inset = 1e-9 * np.where(np.isfinite(lower), np.abs(lower) + 1.0, 0.0)
+        x0 = np.clip(x0, lower + inset, upper - inset)
+        solution = least_squares(
+            lambda x: evaluate(*unpack(x)), x0, jac_sparsity=sparsity, bounds=(lower, upper),
+            loss="huber", f_scale=3.0, x_scale="jac", max_nfev=200, method="trf",
+        )
+        intrinsics, poses = unpack(solution.x)
+        intrinsics = intrinsics.copy()
+        poses = poses.copy()
+
+    residual = evaluate(intrinsics, poses).reshape(-1, 2)
+    rms = float(np.sqrt(np.mean(np.sum(residual ** 2, axis=1))))
+    solved: List[np.ndarray | None] = [None] * len(objects)
+    for slot, index in enumerate(active):
+        solved[index] = poses[slot].copy()
+    return rms, intrinsics, solved
+
+
 def initialize_known_target_state(
     images: Sequence[ImageDetections],
     known_targets3d: Dict[int, np.ndarray],
@@ -904,49 +1099,28 @@ def initialize_known_target_state(
             "Not enough images with known 3D target correspondences to initialize single-camera calibration."
         )
 
-    initial_focal = float(max(width, height))
-    initial_camera_matrix = np.array(
-        [
-            [initial_focal, 0.0, width / 2.0],
-            [0.0, initial_focal, height / 2.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
+    # cv2.calibrateCamera was used here.  It initialises every view itself
+    # from the intrinsic guess, and on this wide-angle data it converged to
+    # different wrong minima (RMS tens of pixels, even negative focal lengths)
+    # for nearly identical inputs.  The robust adjustment below starts from
+    # a data-driven focal length and per-view PnP poses instead.
+    initial_focal, object_points_list, image_points_list = _screened_focal_initialization(
+        object_points_list, image_points_list, width, height,
     )
-    initial_dist_coeffs = np.zeros((5, 1), dtype=np.float64)
-    calibration_rms, camera_matrix, dist_coeffs, rotation_vecs, translation_vecs = cv2.calibrateCamera(
-        object_points_list,
-        image_points_list,
-        (width, height),
-        initial_camera_matrix,
-        initial_dist_coeffs,
-        flags=cv2.CALIB_FIX_K3 | cv2.CALIB_USE_INTRINSIC_GUESS,
-        criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 30, 1e-6),
+    calibration_rms, intrinsics, solved_poses = _robust_intrinsic_adjustment(
+        object_points_list, image_points_list, width, height, initial_focal,
     )
-    dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
-
-    intrinsics = np.array(
-        [
-            float(camera_matrix[0, 0]),
-            float(camera_matrix[1, 1]),
-            float(camera_matrix[0, 2]),
-            float(camera_matrix[1, 2]),
-            float(dist_coeffs[0]) if dist_coeffs.size > 0 else 0.0,
-            float(dist_coeffs[1]) if dist_coeffs.size > 1 else 0.0,
-            float(dist_coeffs[2]) if dist_coeffs.size > 2 else 0.0,
-            float(dist_coeffs[3]) if dist_coeffs.size > 3 else 0.0,
-        ],
-        dtype=np.float64,
-    )
-
     poses = {
-        image_index: np.concatenate([rotation_vec.reshape(3), translation_vec.reshape(3)]).astype(np.float64)
-        for image_index, rotation_vec, translation_vec in zip(image_indices, rotation_vecs, translation_vecs, strict=False)
+        image_index: pose
+        for image_index, pose in zip(image_indices, solved_poses, strict=False)
+        if pose is not None
     }
+    if len(poses) < 2:
+        raise RuntimeError("Known-target initialisation could not pose at least two images.")
     points = {target_id: known_targets3d[target_id].copy() for target_id in sorted(observed_target_ids)}
     print(
         f"initialized from known 3D targets using {len(image_indices)} images and {len(points)} fixed targets "
-        f"(OpenCV RMS {calibration_rms:.4f} px)",
+        f"(robust initialisation RMS {calibration_rms:.4f} px)",
         flush=True,
     )
     return CalibrationState(
@@ -1709,6 +1883,7 @@ def calibrate_camera(
             detections_output_dir=detections_dir_path,
             valid_ids=valid_ids,
             max_id_hamming_distance=max_id_hamming_distance,
+            codebook=valid_ids if known_targets3d is not None else None,
         )
         target_detections_path = save_target_detections(images, camera_name, output_dir)
     else:
@@ -1850,6 +2025,7 @@ def detect_camera(
     valid_ids: Set[int] | None,
     max_id_hamming_distance: int,
     force_detections: bool,
+    codebook: Set[int] | None = None,
 ) -> tuple[DetectionOnlyResult, List[ImageDetections]]:
     image_paths = iter_camera_images(data_root, camera_name, image_root)
     if not image_paths:
@@ -1865,6 +2041,7 @@ def detect_camera(
             detections_output_dir=detections_dir_path,
             valid_ids=valid_ids,
             max_id_hamming_distance=max_id_hamming_distance,
+            codebook=codebook,
         )
         target_detections_path = save_target_detections(images, camera_name, output_dir)
     else:
@@ -1955,6 +2132,7 @@ def main() -> int:
                 valid_ids=valid_ids,
                 max_id_hamming_distance=args.max_id_hamming_distance,
                 force_detections=args.force_detections,
+                codebook=valid_ids if known_targets3d is not None else None,
             )
             result_dict = format_detection_result(result)
             detection_results.append(result_dict)

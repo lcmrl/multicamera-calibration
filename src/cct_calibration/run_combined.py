@@ -589,11 +589,13 @@ def detect_all_cameras(
     min_detections: int = 5,
     force: bool = False,
     initial_intrinsics: Dict[str, np.ndarray] | None = None,
+    codebook: Set[int] | None = None,
 ) -> Dict[str, List[ImageDetections]]:
     """Run CCT detection on all cameras.
 
     Returns dict: cam_name -> list of ImageDetections.
     Image indices are globally unique across cameras.
+    ``codebook`` enables correlation decoding against the known valid IDs.
     """
     all_detections: Dict[str, List[ImageDetections]] = {}
     global_index = 0
@@ -620,6 +622,7 @@ def detect_all_cameras(
                 valid_ids,
                 max_id_hamming_distance,
                 initial_intrinsics=initial_intrinsics.get(cam_name) if initial_intrinsics else None,
+                codebook=codebook,
             )
             # Save detections to cache
             save_target_detections(raw, cam_name, output_dir)
@@ -658,6 +661,7 @@ def refine_detected_centers_after_calibration(
     camera_intrinsics: Dict[str, np.ndarray],
     valid_ids: Set[int] | None = None,
     max_id_hamming_distance: int = 0,
+    codebook: Set[int] | None = None,
 ) -> dict[str, int]:
     """Refine existing verified observations without full-frame redetection.
 
@@ -782,7 +786,9 @@ def refine_detected_centers_after_calibration(
                 flush=True,
             )
             continue
-        detector = CCTDetector(n_bits=14)
+        # Same decoder configuration as production detection, so a locally
+        # recovered ellipse is verified under the same ID rules.
+        detector = CCTDetector(n_bits=14, codebook=codebook)
         count = 0
         accepted = 0
         unavailable = 0
@@ -3065,6 +3071,13 @@ def parse_combined_args() -> argparse.Namespace:
         "--no-pdf-report", action="store_true",
         help="Skip generation of the rich PDF calibration report.",
     )
+    parser.add_argument(
+        "--evaluate-detections", action="store_true", default=False,
+        help="Developer diagnostic (requires --targets3d): project every reference target with "
+             "the final calibration, report detection recall and suspect detections, and "
+             "attribute each miss to the detector stage that rejected it. Writes "
+             "detection_evaluation.json. Re-runs detection on images with misses.",
+    )
     return parser.parse_args()
 
 
@@ -3086,6 +3099,9 @@ def main() -> int:
         return 1
     if args.skip_sfm and known_targets3d is None:
         print("ERROR: --skip-sfm currently requires --targets3d", flush=True)
+        return 1
+    if args.evaluate_detections and known_targets3d is None:
+        print("ERROR: --evaluate-detections requires --targets3d", flush=True)
         return 1
 
     # Auto-detect cameras
@@ -3110,6 +3126,11 @@ def main() -> int:
         valid_ids = set(range(args.valid_id_max + 1))
     elif known_targets3d is not None:
         valid_ids = set(known_targets3d.keys())
+    # With reference coordinates the valid codes are known, so decoding can
+    # correlate against them; otherwise the generic decoder is used.
+    codebook: Set[int] | None = valid_ids if known_targets3d is not None else None
+    if codebook is not None:
+        print(f"codebook decoding enabled with {len(codebook)} valid target IDs", flush=True)
 
     sfm_intrinsics: Dict[str, np.ndarray]
     sfm_poses: Dict[str, Dict[str, np.ndarray]]
@@ -3150,6 +3171,7 @@ def main() -> int:
         min_detections=args.min_detections,
         force=args.force_detections,
         initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
+        codebook=codebook,
     )
 
     if args.checkpoints > 0.0:
@@ -3171,6 +3193,7 @@ def main() -> int:
                 min_detections=args.min_detections,
                 force=True,
                 initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
+                codebook=codebook,
             )
         else:
             print(
@@ -3295,6 +3318,7 @@ def main() -> int:
         detections_by_camera, state.camera_intrinsics,
         valid_ids=valid_ids,
         max_id_hamming_distance=args.max_id_hamming_distance,
+        codebook=codebook,
     )
     center_update_history = [dict(center_updates)]
     # Checkpoint newly recovered ellipse evidence immediately. If a later BA
@@ -3398,6 +3422,7 @@ def main() -> int:
         detections_by_camera, state.camera_intrinsics,
         valid_ids=valid_ids,
         max_id_hamming_distance=args.max_id_hamming_distance,
+        codebook=codebook,
     )
     center_update_history.append(dict(final_center_updates))
     if sum(final_center_updates.values()) > 0:
@@ -3444,6 +3469,7 @@ def main() -> int:
             posed_checkpoint_images, state.camera_intrinsics,
             valid_ids=valid_ids,
             max_id_hamming_distance=args.max_id_hamming_distance,
+            codebook=codebook,
         )
         for camera, images in posed_checkpoint_images.items():
             save_refinement_cache(images, output_dir / camera, merge_existing=True)
@@ -3461,6 +3487,14 @@ def main() -> int:
             f"reconstructed; 3D RMSE="
             f"{summary.get('rmse_3d_m', float('nan')) * 1000.0:.3f} mm",
             flush=True,
+        )
+
+    if args.evaluate_detections:
+        print("  evaluating detections against projected reference targets", flush=True)
+        from cct_calibration.detection_evaluation import evaluate_detections
+        evaluate_detections(
+            state, detections_by_camera, checkpoint_images, known_targets3d,
+            codebook, output_dir / "detection_evaluation.json",
         )
 
     (output_dir / "center_remeasurement.json").write_text(
