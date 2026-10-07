@@ -205,6 +205,8 @@ The multi-camera pipeline automatically generates `calibration_report.pdf` in th
 
 Pass `--no-pdf-report` to skip PDF generation. Use `--observation-sigma-px VALUE` to state the a-priori one-sigma precision of each image coordinate. The reporting code lives in `src/cct_calibration/reporting/`.
 
+Pass `--save-report-plots` to also export every plot included in the PDF as a 600 dpi PNG in `<output-dir>/plots/`. Filenames are numbered in report order and include the plot title. The PDF itself keeps its usual resolution. This flag cannot be combined with `--no-pdf-report`.
+
 ## Output files
 
 ### Multi-camera outputs

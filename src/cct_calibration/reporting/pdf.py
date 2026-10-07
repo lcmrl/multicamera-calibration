@@ -16,6 +16,7 @@ The layout is intentionally minimal: no decorative bands, grades or scores.
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -162,8 +163,12 @@ def _section(number: str, title: str, styles: Dict[str, ParagraphStyle]) -> List
     return [head, rule]
 
 
-def _img(fig, width: float = CONTENT_W) -> Image:
+def _figure_image(fig, width: float = CONTENT_W, *, export_path: Optional[Path] = None) -> Image:
     """Convert a matplotlib figure to a centred, width-scaled image flowable."""
+    if export_path is not None:
+        # Render from the original figure, not the lower-resolution PDF image.
+        fig.savefig(export_path, format="png", dpi=600, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
     fig_bytes = figure_to_bytes(fig)
     buf = io.BytesIO(fig_bytes)
     reader = ImageReader(buf)
@@ -265,7 +270,27 @@ def _parameter_rows(data: ReportData, prefix: str) -> List[List[str]]:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def generate_pdf_report(data: ReportData, out_path: Path) -> Path:
+def generate_pdf_report(
+    data: ReportData, out_path: Path, *, plots_dir: Optional[Path] = None,
+) -> Path:
+    """Build the PDF, optionally exporting every embedded figure at 600 dpi."""
+    if plots_dir is not None:
+        plots_dir = Path(plots_dir)
+        plots_dir.mkdir(parents=True, exist_ok=True)
+    plot_count = 0
+
+    def _img(fig, width: float = CONTENT_W) -> Image:
+        nonlocal plot_count
+        export_path = None
+        if plots_dir is not None:
+            plot_count += 1
+            title = fig._suptitle.get_text() if fig._suptitle is not None else ""
+            if not title:
+                title = next((axis.get_title() for axis in fig.axes if axis.get_title()), "plot")
+            slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")[:100] or "plot"
+            export_path = plots_dir / f"{plot_count:02d}_{slug}.png"
+        return _figure_image(fig, width, export_path=export_path)
+
     S = _styles()
     overall_err = ErrorStats.from_values([r.err_px for r in data.records])
     obj_vals = [r.err_obj_m * 1000.0 for r in data.records if r.err_obj_m is not None]

@@ -3067,9 +3067,14 @@ def parse_combined_args() -> argparse.Namespace:
     parser.add_argument("--valid-ids-file", type=Path, default=None)
     parser.add_argument("--valid-id-max", type=int, default=None)
     parser.add_argument("--max-id-hamming-distance", type=int, default=0)
-    parser.add_argument(
+    report_options = parser.add_mutually_exclusive_group()
+    report_options.add_argument(
         "--no-pdf-report", action="store_true",
         help="Skip generation of the rich PDF calibration report.",
+    )
+    report_options.add_argument(
+        "--save-report-plots", action="store_true",
+        help="Also save every PDF report plot as a 600 dpi PNG in output-dir/plots/.",
     )
     parser.add_argument(
         "--evaluate-detections", action="store_true", default=False,
@@ -3708,8 +3713,11 @@ def main() -> int:
             )
             pdf_path = generate_pdf_report(
                 report_data, output_dir / "calibration_report.pdf",
+                plots_dir=output_dir / "plots" if args.save_report_plots else None,
             )
             print(f"PDF report: {pdf_path}", flush=True)
+            if args.save_report_plots:
+                print(f"Report plots (600 dpi PNG): {output_dir / 'plots'}", flush=True)
         except Exception as exc:  # reporting must never break the pipeline
             print(f"WARNING: PDF report generation failed: {exc}", flush=True)
 
