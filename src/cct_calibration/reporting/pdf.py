@@ -786,6 +786,13 @@ def generate_pdf_report(
     ))
     story.append(PageBreak())
 
+    # Scene geometry applies to any trajectory, including a single camera.
+    if data.rig is not None:
+        scene_fig = fig_scene_geometry(data)
+        if scene_fig is not None:
+            story.append(_img(scene_fig))
+            story.append(PageBreak())
+
     # ── Rig geometry (multi-camera only) ──────────────────────────────────
     if data.mode == "multi-camera" and data.rig is not None:
         story += _section(str(sec_idx + 1), "Rig geometry", S)
@@ -852,9 +859,6 @@ def generate_pdf_report(
                 "the bundle and are network-consistency diagnostics.",
                 S["caption"],
             ))
-        scene_fig = fig_scene_geometry(data)
-        if scene_fig is not None:
-            story.append(_img(scene_fig))
         story.append(PageBreak())
         for pair in rig_pairs:
             story.append(_img(fig_rig_pair_quality(pair)))

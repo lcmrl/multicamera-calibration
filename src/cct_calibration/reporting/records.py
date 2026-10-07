@@ -73,7 +73,7 @@ class CameraInfo:
 
 @dataclass
 class RigInfo:
-    """Multi-camera specific geometry (None for single-camera reports)."""
+    """Camera trajectory and scene geometry; relative orientations are trivial for one camera."""
     relative_poses: Dict[str, np.ndarray]            # cam -> 6-vector (w.r.t. reference)
     rig_poses: Dict[str, np.ndarray]                 # retained frame -> reference-camera pose
     frame_stems: List[str]
@@ -269,7 +269,7 @@ def build_multi_camera_report_data(
     )
 
     return ReportData(
-        mode="multi-camera",
+        mode="multi-camera" if len(state.camera_names) > 1 else "single-camera",
         generated_at=datetime.now(),
         cameras=cameras,
         records=records,

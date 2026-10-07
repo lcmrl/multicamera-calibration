@@ -377,7 +377,8 @@ class CCTDetector:
         rows = np.all((x >= 0) & (x <= width - 1) & (y >= 0) & (y <= height - 1), axis=1)
         if np.mean(rows) < 0.75:
             return None
-        values = cv2.remap(gray.astype(np.float32), x.astype(np.float32), y.astype(np.float32),
+        source = gray if gray.dtype == np.float32 else gray.astype(np.float32)
+        values = cv2.remap(source, x.astype(np.float32), y.astype(np.float32),
                            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         profile = values[rows].mean(axis=0).astype(np.float64)
         gradient = np.gradient(profile, scales)
@@ -431,6 +432,13 @@ class CCTDetector:
                 return False
         return True
 
+    def _float_image(self, gray: np.ndarray) -> np.ndarray:
+        """float32 copy of the current image, converted once per image."""
+        cached = getattr(self, "_float_cache", None)
+        if cached is None or cached[0] is not gray:
+            self._float_cache = (gray, gray.astype(np.float32))
+        return self._float_cache[1]
+
     def _group_hypotheses(self, group: CandidateGroup) -> list:
         """Members ordered from the median scale outwards, capped."""
         members = [ell for _, ell in group.members]
@@ -466,14 +474,12 @@ class CCTDetector:
         r_max = int(round(cy + half))
         c_min = int(round(cx - half))
         c_max = int(round(cx + half))
-        source_valid = np.ones(gray.shape[:2], dtype=np.uint8)
+        pad = 0
+        original_h, original_w = H, W
         if r_min < 0 or c_min < 0 or r_max > H or c_max > W:
             pad = half + 2
             gray = cv2.copyMakeBorder(gray, pad, pad, pad, pad,
                                       cv2.BORDER_REFLECT_101)
-            source_valid = cv2.copyMakeBorder(
-                source_valid, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0,
-            )
             cx += pad
             cy += pad
             H, W = gray.shape[:2]
@@ -503,14 +509,31 @@ class CCTDetector:
             [out_size / 2.0,          out_size / 2.0],
         ])
         M = cv2.getAffineTransform(src_pts, dst_pts)
-        warped = cv2.warpAffine(gray, M, (out_size, out_size),
+        # Warp only the source footprint of the patch (plus an interpolation
+        # margin) instead of the whole image: the result is the same, but no
+        # full-size arrays are created per candidate on large images.
+        inverse = cv2.invertAffineTransform(M)
+        corners = np.array([[0.0, 0.0, 1.0], [out_size, 0.0, 1.0],
+                            [0.0, out_size, 1.0], [out_size, out_size, 1.0]])
+        footprint = corners @ inverse.T
+        x0 = min(max(int(np.floor(footprint[:, 0].min())) - 2, 0), W - 1)
+        y0 = min(max(int(np.floor(footprint[:, 1].min())) - 2, 0), H - 1)
+        x1 = max(min(int(np.ceil(footprint[:, 0].max())) + 3, W), x0 + 1)
+        y1 = max(min(int(np.ceil(footprint[:, 1].max())) + 3, H), y0 + 1)
+        M_crop = M.copy()
+        M_crop[:, 2] += M[:, :2] @ np.array([x0, y0], dtype=np.float64)
+        warped = cv2.warpAffine(gray[y0:y1, x0:x1], M_crop, (out_size, out_size),
                                 flags=cv2.INTER_LINEAR,
                                 borderMode=cv2.BORDER_CONSTANT,
                                 borderValue=128)
         if not return_mask:
             return warped
+        # Valid source pixels are those of the original (unpadded) image.
+        source_valid = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        source_valid[max(pad - y0, 0):max(pad + original_h - y0, 0),
+                     max(pad - x0, 0):max(pad + original_w - x0, 0)] = 1
         valid = cv2.warpAffine(
-            source_valid, M, (out_size, out_size),
+            source_valid, M_crop, (out_size, out_size),
             flags=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
@@ -858,7 +881,7 @@ class CCTDetector:
         failure = "validate"
         for ell in hypotheses:
             counts["hypotheses"] += 1
-            scale = self._measure_dot_scale(measure_gray, ell)
+            scale = self._measure_dot_scale(self._float_image(measure_gray), ell)
             if scale is not None:
                 counts["scale_measured"] += 1
                 (cx, cy), (aw, ah), angle = ell

@@ -24,8 +24,11 @@ from typing import Dict, List, Set
 import cv2
 import numpy as np
 
-from cct_detect.detector import CCTDetector
+from concurrent.futures import ProcessPoolExecutor
+
 from cct_calibration.run import (
+    _detector_for,
+    _init_detection_worker,
     ImageDetections,
     project_point,
     rotation_matrix_from_pose,
@@ -49,6 +52,48 @@ def _target_normals(points: Dict[int, np.ndarray], neighbours: int = 6) -> Dict[
     return normals
 
 
+def _attribute_image_misses(path: Path, queries: list, codebook: Set[int] | None) -> list:
+    """Detector stage for each missed target of one image (process-safe).
+
+    ``queries`` holds (projected_uv, dot_radius_px, target_id) per miss; the
+    result holds (stage, decoded_ids or None) in the same order.
+    """
+    image = cv2.imread(str(path))
+    if image is None:
+        return [("image_unreadable", None)] * len(queries)
+    detector = _detector_for(codebook)
+    detections, diagnostics = detector.detect_with_diagnostics(image)
+    outcomes: list = [None] * len(queries)
+    unresolved = []
+    for index, (projected_uv, dot_radius_px, target_id) in enumerate(queries):
+        uv = np.asarray(projected_uv)
+        radius = max(6.0, dot_radius_px)
+        nearby = [d for d in detections if np.linalg.norm(np.asarray(d.center) - uv) <= max(10.0, 2.0 * radius)]
+        if any(d.target_id == target_id for d in nearby):
+            outcomes[index] = ("detected_then_dropped_by_pipeline", None)
+            continue
+        if nearby:
+            outcomes[index] = ("decoded_as_other_id", sorted({int(d.target_id) for d in nearby}))
+            continue
+        records = [r for r in diagnostics.rejected
+                   if np.hypot(r["x"] - uv[0], r["y"] - uv[1]) <= radius]
+        if records:
+            closest = min(records, key=lambda r: np.hypot(r["x"] - uv[0], r["y"] - uv[1]))
+            outcomes[index] = (str(closest["stage"]), None)
+        else:
+            unresolved.append(index)
+    if unresolved:
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(
+            cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+        reasons = detector.contour_gate_reasons(
+            gray, np.array([queries[index][0] for index in unresolved]),
+            np.array([max(6.0, queries[index][1]) for index in unresolved]),
+        )
+        for index, reason in zip(unresolved, reasons):
+            outcomes[index] = (f"candidate_gate:{reason}", None)
+    return outcomes
+
+
 def evaluate_detections(
     state,
     detections_by_camera: Dict[str, List[ImageDetections]],
@@ -57,6 +102,8 @@ def evaluate_detections(
     codebook: Set[int] | None,
     output_path: Path,
     incidence_limit_deg: float = 75.0,
+    workers: int = 1,
+    frame_stems: Set[str] | None = None,
 ) -> dict:
     # Deferred import: run_combined imports this module lazily.
     from cct_calibration.run_combined import compose_poses
@@ -76,6 +123,8 @@ def evaluate_detections(
 
     poses: Dict[tuple[str, str], np.ndarray] = {}
     for camera, stem in images:
+        if frame_stems is not None and stem not in frame_stems:
+            continue  # not part of the final solution (e.g. dropped frame)
         rig_pose = state.rig_poses.get(stem)
         if rig_pose is not None and camera in state.relative_poses:
             poses[(camera, stem)] = compose_poses(rig_pose, state.relative_poses[camera])
@@ -187,49 +236,33 @@ def evaluate_detections(
             })
 
     # Attribute misses by re-running the detector on the affected images.
-    detector = CCTDetector(n_bits=14, codebook=codebook)
     by_image: Dict[tuple[str, str], list[dict]] = defaultdict(list)
     for miss in misses:
         by_image[(miss["camera"], miss["image"])].append(miss)
     print(f"  detection evaluation: attributing {len(misses)} misses in {len(by_image)} images", flush=True)
-    for number, ((camera, image_name), items) in enumerate(sorted(by_image.items()), start=1):
+    jobs = []
+    for (camera, image_name), items in sorted(by_image.items()):
         path = next(e["path"] for (c, _), e in images.items() if c == camera and e["path"].name == image_name)
-        image = cv2.imread(str(path))
-        if image is None:
-            for item in items:
-                item["stage"] = "image_unreadable"
-            continue
-        detections, diagnostics = detector.detect_with_diagnostics(image)
-        unresolved = []
-        for item in items:
-            uv = np.asarray(item["projected_uv"])
-            radius = max(6.0, item["dot_radius_px"])
-            nearby = [d for d in detections if np.linalg.norm(np.asarray(d.center) - uv) <= max(10.0, 2.0 * radius)]
-            if any(d.target_id == item["target_id"] for d in nearby):
-                item["stage"] = "detected_then_dropped_by_pipeline"
-                continue
-            if nearby:
-                item["stage"] = "decoded_as_other_id"
-                item["decoded_ids"] = sorted({int(d.target_id) for d in nearby})
-                continue
-            records = [r for r in diagnostics.rejected
-                       if np.hypot(r["x"] - uv[0], r["y"] - uv[1]) <= radius]
-            if records:
-                closest = min(records, key=lambda r: np.hypot(r["x"] - uv[0], r["y"] - uv[1]))
-                item["stage"] = str(closest["stage"])
-            else:
-                unresolved.append(item)
-        if unresolved:
-            gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(
-                cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
-            reasons = detector.contour_gate_reasons(
-                gray, np.array([item["projected_uv"] for item in unresolved]),
-                np.array([max(6.0, item["dot_radius_px"]) for item in unresolved]),
-            )
-            for item, reason in zip(unresolved, reasons):
-                item["stage"] = f"candidate_gate:{reason}"
-        if number % 25 == 0 or number == len(by_image):
-            print(f"    attributed {number}/{len(by_image)} images", flush=True)
+        jobs.append((path, [(item["projected_uv"], item["dot_radius_px"], item["target_id"]) for item in items]))
+    workers = max(1, min(int(workers), len(jobs)))
+    pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_detection_worker) if workers > 1 else None
+    try:
+        if pool is not None:
+            results = pool.map(_attribute_image_misses, [job[0] for job in jobs],
+                               [job[1] for job in jobs], [codebook] * len(jobs))
+        else:
+            results = (_attribute_image_misses(path, queries, codebook) for path, queries in jobs)
+        for number, (((camera, image_name), items), outcomes) in enumerate(
+                zip(sorted(by_image.items()), results), start=1):
+            for item, (stage, decoded_ids) in zip(items, outcomes):
+                item["stage"] = stage
+                if decoded_ids is not None:
+                    item["decoded_ids"] = decoded_ids
+            if number % 25 == 0 or number == len(by_image):
+                print(f"    attributed {number}/{len(by_image)} images", flush=True)
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
     stages_by_camera: Dict[str, Counter] = defaultdict(Counter)
     for miss in misses:

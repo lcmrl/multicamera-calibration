@@ -860,7 +860,9 @@ def fig_projection_uncertainty(data: ReportData, camera: CameraInfo) -> plt.Figu
 
 def fig_uncertainty_vs_distance(data: ReportData) -> plt.Figure | None:
     depths = np.array([record.depth_m for record in data.records if record.depth_m is not None])
-    if data.adjustment is None or data.rig is None or depths.size == 0:
+    # Rig-only figure: the curves are defined relative to the reference camera,
+    # whose pose is held fixed, so a single camera has nothing meaningful to plot.
+    if data.adjustment is None or data.rig is None or depths.size == 0 or len(data.cameras) < 2:
         return None
     near = max(float(np.percentile(depths, 2)), 1e-3)
     far = max(float(np.percentile(depths, 98)), near * 1.05)

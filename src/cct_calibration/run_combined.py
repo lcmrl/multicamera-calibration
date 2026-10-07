@@ -57,10 +57,21 @@ from cct_calibration.run import (
     _filter_inlier_observations,
 )
 from cct_detect.refinement import prepare_refinement_image, refine_projected_center
+from cct_calibration.run import _detector_for, _init_detection_worker
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+
+def list_images(directory: Path) -> List[Path]:
+    """Image files directly inside ``directory`` (case-insensitive suffixes)."""
+    if not directory.is_dir():
+        return []
+    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+
 
 def parse_known_baseline_argument(raw: object) -> tuple[float | None, np.ndarray | None]:
     """Normalize the CLI baseline input.
@@ -263,7 +274,7 @@ def run_sfm(
 
     # Determine image dimensions from first image
     first_cam_dir = image_root / camera_names[0]
-    first_img_path = sorted(first_cam_dir.glob("*.jpg"))[0]
+    first_img_path = list_images(first_cam_dir)[0]
     first_img = cv2.imread(str(first_img_path))
     img_h, img_w = first_img.shape[:2]
 
@@ -290,7 +301,7 @@ def run_sfm(
             dst = rig_dir / cam_name
             dst.mkdir(parents=True, exist_ok=True)
             src_dir = image_root / cam_name
-            for img in sorted(src_dir.glob("*.jpg")):
+            for img in list_images(src_dir):
                 target = dst / img.name
                 if not target.exists():
                     shutil.copy2(str(img), str(target))
@@ -348,14 +359,20 @@ def run_sfm(
 
         # Create images and frames
         frames_dir = image_root / camera_names[0]
-        frame_stems = sorted([f.stem for f in frames_dir.glob("*.jpg")])
+        frame_stems = sorted([f.stem for f in list_images(frames_dir)])
+        file_by_stem = {
+            cam_name: {f.stem: f.name for f in list_images(image_root / cam_name)}
+            for cam_name in camera_names
+        }
         image_id = 1
         frame_id = 1
         for stem in frame_stems:
             colmap_frame = pycolmap.Frame({"frame_id": frame_id, "rig_id": 1})
             frame_id += 1
             for cam_name in camera_names:
-                img_name = f"rig1/{cam_name}/{stem}.jpg"
+                if stem not in file_by_stem[cam_name]:
+                    continue
+                img_name = f"rig1/{cam_name}/{file_by_stem[cam_name][stem]}"
                 image = pycolmap.Image(
                     name=img_name,
                     points2D=np.empty((0, 2), dtype=np.float64),
@@ -590,6 +607,7 @@ def detect_all_cameras(
     force: bool = False,
     initial_intrinsics: Dict[str, np.ndarray] | None = None,
     codebook: Set[int] | None = None,
+    workers: int = 1,
 ) -> Dict[str, List[ImageDetections]]:
     """Run CCT detection on all cameras.
 
@@ -602,7 +620,7 @@ def detect_all_cameras(
 
     for cam_name in camera_names:
         cam_dir = image_root / cam_name
-        image_paths = sorted(cam_dir.glob("*.jpg"))
+        image_paths = list_images(cam_dir)
         if not image_paths:
             print(f"  warning: no images found for {cam_name}", flush=True)
             continue
@@ -623,6 +641,7 @@ def detect_all_cameras(
                 max_id_hamming_distance,
                 initial_intrinsics=initial_intrinsics.get(cam_name) if initial_intrinsics else None,
                 codebook=codebook,
+                workers=workers,
             )
             # Save detections to cache
             save_target_detections(raw, cam_name, output_dir)
@@ -656,111 +675,213 @@ def detect_all_cameras(
     return all_detections
 
 
+def _recover_verified_ellipse(
+    image: np.ndarray,
+    expected_id: int,
+    seed: np.ndarray,
+    detector: CCTDetector,
+    valid_ids: Set[int] | None,
+    max_id_hamming_distance: int,
+) -> tuple | None:
+    """Re-detect one known target in bounded ROIs around its observation."""
+    height, width = image.shape[:2]
+    for half_size in (64, 128, 256, 384):
+        center_x, center_y = float(seed[0]), float(seed[1])
+        left = max(0, int(np.floor(center_x - half_size)))
+        top = max(0, int(np.floor(center_y - half_size)))
+        right = min(width, int(np.ceil(center_x + half_size)))
+        bottom = min(height, int(np.ceil(center_y + half_size)))
+        if right - left < 32 or bottom - top < 32:
+            continue
+        candidates = detector.detect(image[top:bottom, left:right])
+        associated: list[tuple] = []
+        for candidate in candidates:
+            normalized_id, _ = normalize_target_id(
+                int(candidate.target_id), valid_ids, max_id_hamming_distance,
+            )
+            if normalized_id != expected_id:
+                continue
+            (local_x, local_y), axes, angle = candidate.ellipse
+            global_center = np.array([local_x + left, local_y + top], dtype=np.float64)
+            radius = max(axes) / 2.0
+            if np.linalg.norm(global_center - seed) > max(2.0, 0.4 * radius):
+                continue
+            # The strict verifier needs the complete three-ring target.
+            # Do not cache evidence whose outer ring touched the ROI edge.
+            margin = 3.2 * radius + 2.0
+            if min(local_x, local_y, right - left - local_x, bottom - top - local_y) < margin:
+                continue
+            associated.append((
+                (float(global_center[0]), float(global_center[1])),
+                (float(axes[0]), float(axes[1])),
+                float(angle),
+            ))
+        if len(associated) == 1:
+            return associated[0]
+        if len(associated) > 1:
+            return None
+    return None
+
+
+def _cached_model_is_current(
+    images: Sequence[ImageDetections], current: np.ndarray,
+) -> tuple[bool, float, float]:
+    old_models: list[np.ndarray] = []
+    sample_points: list[np.ndarray] = []
+    for image_record in images:
+        for target_id, point in image_record.detections.items():
+            status = image_record.refinement_status.get(target_id, {})
+            # Local ellipse recovery depends on the immutable image and
+            # observation, not the camera model. Do not repeat a bounded
+            # search that already exhausted all permitted ROIs.
+            if (
+                target_id not in image_record.refinement_ellipses
+                and not status.get("recovery_exhausted", False)
+            ):
+                return False, float("inf"), float("inf")
+            values = status.get("intrinsics")
+            if values is None:
+                return False, float("inf"), float("inf")
+            model = np.asarray(values, dtype=np.float64)
+            if model.shape != (8,) or not np.all(np.isfinite(model)):
+                return False, float("inf"), float("inf")
+            old_models.append(model)
+            sample_points.append(np.asarray(point, dtype=np.float64))
+    if not old_models or not sample_points:
+        return False, float("inf"), float("inf")
+    old = old_models[0]
+    if any(not np.allclose(model, old, rtol=0.0, atol=1e-12) for model in old_models[1:]):
+        return False, float("inf"), float("inf")
+    points = np.asarray(sample_points, dtype=np.float64).reshape(-1, 1, 2)
+    old_rays = cv2.undistortPoints(
+        points, intrinsics_matrix(old), distortion_vector(old),
+    ).reshape(-1, 2)
+    new_rays = cv2.undistortPoints(
+        points, intrinsics_matrix(current), distortion_vector(current),
+    ).reshape(-1, 2)
+    pixel_scale = np.array([current[0], current[1]], dtype=np.float64)
+    shifts = np.linalg.norm((new_rays - old_rays) * pixel_scale, axis=1)
+    shifts = shifts[np.isfinite(shifts)]
+    if shifts.size == 0:
+        return False, float("inf"), float("inf")
+    p95 = float(np.percentile(shifts, 95))
+    maximum = float(np.max(shifts))
+    return p95 <= 0.02 and maximum <= 0.05, p95, maximum
+
+def _refine_image_centres(
+    image_record: ImageDetections,
+    intrinsics: np.ndarray,
+    valid_ids: Set[int] | None,
+    max_id_hamming_distance: int,
+    codebook: Set[int] | None,
+):
+    """Calibrated centre refinement of one image (process-safe).
+
+    Returns the updated record, the (changed, accepted, unavailable,
+    recovered) counters and the accepted displacements.
+    """
+    # Same decoder configuration as production detection, so a locally
+    # recovered ellipse is verified under the same ID rules.
+    detector = _detector_for(codebook)
+    count = accepted = unavailable = recovered = 0
+    displacements: list[float] = []
+    image = cv2.imread(str(image_record.image_path))
+    if image is None:
+        unavailable += len(image_record.detections)
+        return image_record, (count, accepted, unavailable, recovered), displacements
+    raw_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    prepared_gray: np.ndarray | None = None
+    for target_id in list(image_record.detections):
+        previous = image_record.detections[target_id]
+        ellipse = image_record.refinement_ellipses.get(target_id)
+        if ellipse is None:
+            ellipse = _recover_verified_ellipse(
+                image, int(target_id), np.asarray(previous, dtype=np.float64), detector,
+                valid_ids, max_id_hamming_distance,
+            )
+            if ellipse is not None:
+                image_record.refinement_ellipses[target_id] = ellipse
+                image_record.raw_detections[target_id] = np.asarray(
+                    ellipse[0], dtype=np.float64,
+                )
+                recovered += 1
+        if ellipse is None:
+            image_record.refinement_status[target_id] = {
+                "method": "unchanged",
+                "intrinsics": [float(value) for value in intrinsics],
+                "reason": "verified ellipse unavailable after bounded local recovery",
+                "recovery_exhausted": True,
+            }
+            unavailable += 1
+            continue
+        image_record.raw_detections.setdefault(
+            target_id, np.asarray(ellipse[0], dtype=np.float64),
+        )
+        if prepared_gray is None:
+            prepared_gray = prepare_refinement_image(raw_gray)
+        estimate = refine_projected_center(
+            prepared_gray, ellipse, intrinsics, image_is_prepared=True,
+        )
+        radius = max(ellipse[1]) / 2.0
+        measured = np.asarray(estimate.projected_center_px, dtype=np.float64)
+        shift_from_ellipse = float(np.linalg.norm(measured - np.asarray(ellipse[0])))
+        if (
+            not estimate.valid
+            or not np.all(np.isfinite(measured))
+            or shift_from_ellipse > max(2.0, 0.5 * radius)
+        ):
+            image_record.refinement_status[target_id] = {
+                "method": "unchanged",
+                "intrinsics": [float(value) for value in intrinsics],
+                "reason": estimate.reason if not estimate.valid else "centre displacement gate",
+                "edge_rms_px": (
+                    float(estimate.edge_rms_px)
+                    if np.isfinite(estimate.edge_rms_px) else None
+                ),
+            }
+            unavailable += 1
+            continue
+        displacement = float(np.linalg.norm(measured - previous))
+        displacements.append(displacement)
+        accepted += 1
+        if displacement > 1e-9:
+            image_record.detections[target_id] = measured
+            count += 1
+        image_record.refinement_status[target_id] = {
+            "method": estimate.method,
+            "intrinsics": [float(value) for value in intrinsics],
+            "reason": estimate.reason,
+            "edge_rms_px": (
+                float(estimate.edge_rms_px)
+                if np.isfinite(estimate.edge_rms_px) else None
+            ),
+        }
+    return image_record, (count, accepted, unavailable, recovered), displacements
+
+
 def refine_detected_centers_after_calibration(
     detections_by_camera: Dict[str, List[ImageDetections]],
     camera_intrinsics: Dict[str, np.ndarray],
     valid_ids: Set[int] | None = None,
     max_id_hamming_distance: int = 0,
     codebook: Set[int] | None = None,
+    workers: int = 1,
 ) -> dict[str, int]:
     """Refine existing verified observations without full-frame redetection.
 
     Cached verified ellipses go directly to the calibrated conic estimator.
     Legacy ID/x/y caches recover missing ellipses inside bounded local ROIs,
     using the unchanged strict ring/code detector and requiring the same ID.
-    Refinement can never add, remove, or relabel an observation.
+    Refinement can never add, remove, or relabel an observation.  Images are
+    independent, so with ``workers`` > 1 they are refined in parallel worker
+    processes; results are applied in input order and are identical.
     """
+    from concurrent.futures import ProcessPoolExecutor
 
-    def recover_verified_ellipse(
-        image: np.ndarray,
-        expected_id: int,
-        seed: np.ndarray,
-        detector: CCTDetector,
-    ) -> tuple | None:
-        height, width = image.shape[:2]
-        for half_size in (64, 128, 256, 384):
-            center_x, center_y = float(seed[0]), float(seed[1])
-            left = max(0, int(np.floor(center_x - half_size)))
-            top = max(0, int(np.floor(center_y - half_size)))
-            right = min(width, int(np.ceil(center_x + half_size)))
-            bottom = min(height, int(np.ceil(center_y + half_size)))
-            if right - left < 32 or bottom - top < 32:
-                continue
-            candidates = detector.detect(image[top:bottom, left:right])
-            associated: list[tuple] = []
-            for candidate in candidates:
-                normalized_id, _ = normalize_target_id(
-                    int(candidate.target_id), valid_ids, max_id_hamming_distance,
-                )
-                if normalized_id != expected_id:
-                    continue
-                (local_x, local_y), axes, angle = candidate.ellipse
-                global_center = np.array([local_x + left, local_y + top], dtype=np.float64)
-                radius = max(axes) / 2.0
-                if np.linalg.norm(global_center - seed) > max(2.0, 0.4 * radius):
-                    continue
-                # The strict verifier needs the complete three-ring target.
-                # Do not cache evidence whose outer ring touched the ROI edge.
-                margin = 3.2 * radius + 2.0
-                if min(local_x, local_y, right - left - local_x, bottom - top - local_y) < margin:
-                    continue
-                associated.append((
-                    (float(global_center[0]), float(global_center[1])),
-                    (float(axes[0]), float(axes[1])),
-                    float(angle),
-                ))
-            if len(associated) == 1:
-                return associated[0]
-            if len(associated) > 1:
-                return None
-        return None
-
-    def cached_model_is_current(
-        images: Sequence[ImageDetections], current: np.ndarray,
-    ) -> tuple[bool, float, float]:
-        old_models: list[np.ndarray] = []
-        sample_points: list[np.ndarray] = []
-        for image_record in images:
-            for target_id, point in image_record.detections.items():
-                status = image_record.refinement_status.get(target_id, {})
-                # Local ellipse recovery depends on the immutable image and
-                # observation, not the camera model. Do not repeat a bounded
-                # search that already exhausted all permitted ROIs.
-                if (
-                    target_id not in image_record.refinement_ellipses
-                    and not status.get("recovery_exhausted", False)
-                ):
-                    return False, float("inf"), float("inf")
-                values = status.get("intrinsics")
-                if values is None:
-                    return False, float("inf"), float("inf")
-                model = np.asarray(values, dtype=np.float64)
-                if model.shape != (8,) or not np.all(np.isfinite(model)):
-                    return False, float("inf"), float("inf")
-                old_models.append(model)
-                sample_points.append(np.asarray(point, dtype=np.float64))
-        if not old_models or not sample_points:
-            return False, float("inf"), float("inf")
-        old = old_models[0]
-        if any(not np.allclose(model, old, rtol=0.0, atol=1e-12) for model in old_models[1:]):
-            return False, float("inf"), float("inf")
-        points = np.asarray(sample_points, dtype=np.float64).reshape(-1, 1, 2)
-        old_rays = cv2.undistortPoints(
-            points, intrinsics_matrix(old), distortion_vector(old),
-        ).reshape(-1, 2)
-        new_rays = cv2.undistortPoints(
-            points, intrinsics_matrix(current), distortion_vector(current),
-        ).reshape(-1, 2)
-        pixel_scale = np.array([current[0], current[1]], dtype=np.float64)
-        shifts = np.linalg.norm((new_rays - old_rays) * pixel_scale, axis=1)
-        shifts = shifts[np.isfinite(shifts)]
-        if shifts.size == 0:
-            return False, float("inf"), float("inf")
-        p95 = float(np.percentile(shifts, 95))
-        maximum = float(np.max(shifts))
-        return p95 <= 0.02 and maximum <= 0.05, p95, maximum
 
     updated: dict[str, int] = {}
+    workers = max(1, int(workers))
+    pool = None  # created on first use; cameras with current caches need none
     all_images = sum(len(images) for images in detections_by_camera.values())
     all_observations = sum(
         len(image.detections)
@@ -773,137 +894,87 @@ def refine_detected_centers_after_calibration(
         f"images={all_images}, observations={all_observations}",
         flush=True,
     )
-    for cam_name, images in detections_by_camera.items():
-        intrinsics = camera_intrinsics.get(cam_name)
-        if intrinsics is None:
-            continue
-        cache_current, model_p95, model_max = cached_model_is_current(images, intrinsics)
-        if cache_current:
-            updated[cam_name] = 0
-            print(
-                f"    {cam_name}: cached refined coordinates reused "
-                f"(camera-model change p95={model_p95:.4f}px, max={model_max:.4f}px)",
-                flush=True,
-            )
-            continue
-        # Same decoder configuration as production detection, so a locally
-        # recovered ellipse is verified under the same ID rules.
-        detector = CCTDetector(n_bits=14, codebook=codebook)
-        count = 0
-        accepted = 0
-        unavailable = 0
-        recovered = 0
-        displacements: list[float] = []
-        started = time.perf_counter()
-        last_progress = started
-        evidence_before = sum(
-            len(set(image.detections) & set(image.refinement_ellipses)) for image in images
-        )
-        print(
-            f"    {cam_name}: {len(images)} images, "
-            f"cached detections={evidence_before}/{sum(len(image.detections) for image in images)}",
-            flush=True,
-        )
-        for image_number, image_record in enumerate(images, start=1):
-            image = cv2.imread(str(image_record.image_path))
-            if image is None:
-                unavailable += len(image_record.detections)
+    try:
+        for cam_name, images in detections_by_camera.items():
+            intrinsics = camera_intrinsics.get(cam_name)
+            if intrinsics is None:
                 continue
-            raw_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            prepared_gray: np.ndarray | None = None
-            for target_id in list(image_record.detections):
-                previous = image_record.detections[target_id]
-                ellipse = image_record.refinement_ellipses.get(target_id)
-                if ellipse is None:
-                    ellipse = recover_verified_ellipse(
-                        image, int(target_id), np.asarray(previous, dtype=np.float64), detector,
-                    )
-                    if ellipse is not None:
-                        image_record.refinement_ellipses[target_id] = ellipse
-                        image_record.raw_detections[target_id] = np.asarray(
-                            ellipse[0], dtype=np.float64,
-                        )
-                        recovered += 1
-                if ellipse is None:
-                    image_record.refinement_status[target_id] = {
-                        "method": "unchanged",
-                        "intrinsics": [float(value) for value in intrinsics],
-                        "reason": "verified ellipse unavailable after bounded local recovery",
-                        "recovery_exhausted": True,
-                    }
-                    unavailable += 1
-                    continue
-                image_record.raw_detections.setdefault(
-                    target_id, np.asarray(ellipse[0], dtype=np.float64),
-                )
-                if prepared_gray is None:
-                    prepared_gray = prepare_refinement_image(raw_gray)
-                estimate = refine_projected_center(
-                    prepared_gray, ellipse, intrinsics, image_is_prepared=True,
-                )
-                radius = max(ellipse[1]) / 2.0
-                measured = np.asarray(estimate.projected_center_px, dtype=np.float64)
-                shift_from_ellipse = float(np.linalg.norm(measured - np.asarray(ellipse[0])))
-                if (
-                    not estimate.valid
-                    or not np.all(np.isfinite(measured))
-                    or shift_from_ellipse > max(2.0, 0.5 * radius)
-                ):
-                    image_record.refinement_status[target_id] = {
-                        "method": "unchanged",
-                        "intrinsics": [float(value) for value in intrinsics],
-                        "reason": estimate.reason if not estimate.valid else "centre displacement gate",
-                        "edge_rms_px": (
-                            float(estimate.edge_rms_px)
-                            if np.isfinite(estimate.edge_rms_px) else None
-                        ),
-                    }
-                    unavailable += 1
-                    continue
-                displacement = float(np.linalg.norm(measured - previous))
-                displacements.append(displacement)
-                accepted += 1
-                if displacement > 1e-9:
-                    image_record.detections[target_id] = measured
-                    count += 1
-                image_record.refinement_status[target_id] = {
-                    "method": estimate.method,
-                    "intrinsics": [float(value) for value in intrinsics],
-                    "reason": estimate.reason,
-                    "edge_rms_px": (
-                        float(estimate.edge_rms_px)
-                        if np.isfinite(estimate.edge_rms_px) else None
-                    ),
-                }
-            now = time.perf_counter()
-            if image_number == len(images) or image_number % 20 == 0 or now - last_progress >= 10.0:
-                elapsed = max(now - started, 1e-9)
-                rate = image_number / elapsed
-                eta = (len(images) - image_number) / max(rate, 1e-9)
+            cache_current, model_p95, model_max = _cached_model_is_current(images, intrinsics)
+            if cache_current:
+                updated[cam_name] = 0
                 print(
-                    f"      {cam_name}: {image_number}/{len(images)} images; "
-                    f"accepted={accepted}, recovered={recovered}, unavailable={unavailable}; "
-                    f"{rate:.2f} images/s, ETA={eta / 60.0:.1f} min",
+                    f"    {cam_name}: cached refined coordinates reused "
+                    f"(camera-model change p95={model_p95:.4f}px, max={model_max:.4f}px)",
                     flush=True,
                 )
-                last_progress = now
-        updated[cam_name] = count
-        elapsed = time.perf_counter() - started
-        if displacements:
-            displacement_values = np.asarray(displacements, dtype=np.float64)
-            displacement_text = (
-                f"median={np.median(displacement_values):.4f}px, "
-                f"p95={np.percentile(displacement_values, 95):.4f}px, "
-                f"max={np.max(displacement_values):.4f}px"
+                continue
+            count = 0
+            accepted = 0
+            unavailable = 0
+            recovered = 0
+            displacements: list[float] = []
+            started = time.perf_counter()
+            last_progress = started
+            evidence_before = sum(
+                len(set(image.detections) & set(image.refinement_ellipses)) for image in images
             )
-        else:
-            displacement_text = "no accepted coordinate updates"
-        print(
-            f"    {cam_name}: finished in {elapsed:.1f}s; changed={count}, "
-            f"accepted={accepted}, locally recovered detections={recovered}, unavailable={unavailable}; "
-            + displacement_text,
-            flush=True,
-        )
+            print(
+                f"    {cam_name}: {len(images)} images, "
+                f"cached detections={evidence_before}/{sum(len(image.detections) for image in images)}",
+                flush=True,
+            )
+            arguments = [(record, intrinsics, valid_ids, max_id_hamming_distance, codebook) for record in images]
+            if workers > 1 and pool is None:
+                pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_detection_worker)
+            if pool is not None:
+                results = pool.map(_refine_image_centres, *zip(*arguments))
+            else:
+                results = (_refine_image_centres(*item) for item in arguments)
+            for image_number, (image_record, result) in enumerate(zip(images, results), start=1):
+                refined, counters, image_displacements = result
+                if refined is not image_record:
+                    # Update the caller's record in place (other containers may share it).
+                    for name in ("detections", "raw_detections", "refinement_ellipses", "refinement_status"):
+                        mapping = getattr(image_record, name)
+                        mapping.clear()
+                        mapping.update(getattr(refined, name))
+                count += counters[0]
+                accepted += counters[1]
+                unavailable += counters[2]
+                recovered += counters[3]
+                displacements.extend(image_displacements)
+                now = time.perf_counter()
+                if image_number == len(images) or image_number % 20 == 0 or now - last_progress >= 10.0:
+                    elapsed = max(now - started, 1e-9)
+                    rate = image_number / elapsed
+                    eta = (len(images) - image_number) / max(rate, 1e-9)
+                    print(
+                        f"      {cam_name}: {image_number}/{len(images)} images; "
+                        f"accepted={accepted}, recovered={recovered}, unavailable={unavailable}; "
+                        f"{rate:.2f} images/s, ETA={eta / 60.0:.1f} min",
+                        flush=True,
+                    )
+                    last_progress = now
+            updated[cam_name] = count
+            elapsed = time.perf_counter() - started
+            if displacements:
+                displacement_values = np.asarray(displacements, dtype=np.float64)
+                displacement_text = (
+                    f"median={np.median(displacement_values):.4f}px, "
+                    f"p95={np.percentile(displacement_values, 95):.4f}px, "
+                    f"max={np.max(displacement_values):.4f}px"
+                )
+            else:
+                displacement_text = "no accepted coordinate updates"
+            print(
+                f"    {cam_name}: finished in {elapsed:.1f}s; changed={count}, "
+                f"accepted={accepted}, locally recovered detections={recovered}, unavailable={unavailable}; "
+                + displacement_text,
+                flush=True,
+            )
+    finally:
+        if pool is not None:
+            pool.shutdown()
     return updated
 
 
@@ -1888,24 +1959,47 @@ def multi_cam_collect_observations(
     detections_by_camera: Dict[str, List[ImageDetections]],
     state: MultiCameraState,
     max_reprojection_error: float | None,
+    unobservable: List[Tuple[str, str, int, np.ndarray]] | None = None,
 ) -> List[Tuple[str, str, int, np.ndarray]]:
     """Collect valid observations across all cameras.
 
-    Returns list of (cam_name, frame_stem, target_id, 2D_point).
+    Returns list of (cam_name, frame_stem, target_id, 2D_point).  A detection
+    whose target lies behind the camera, or outside its field of view (10%
+    beyond the undistorted image corners), cannot be that target: it is a
+    false identification and is skipped (and appended to ``unobservable``).
     """
     observations: List[Tuple[str, str, int, np.ndarray]] = []
     for cam_name, dets in detections_by_camera.items():
         intrinsics = state.camera_intrinsics[cam_name]
         rel_pose = state.relative_poses[cam_name]
+        field_radius: float | None = None
         for det in dets:
             stem = det.image_path.stem
             rig_pose = state.rig_poses.get(stem)
             if rig_pose is None:
                 continue
             abs_pose = compose_poses(rig_pose, rel_pose)
+            rotation = rotation_matrix_from_pose(abs_pose)
+            if field_radius is None and det.width > 0 and det.height > 0:
+                # Pinhole radius of the image corners; a radius test rather than
+                # a pixel test, because the polynomial distortion model can fold
+                # far off-axis directions back into the image.
+                corners = np.array([[0.0, 0.0], [det.width - 1.0, 0.0], [0.0, det.height - 1.0],
+                                    [det.width - 1.0, det.height - 1.0]]).reshape(-1, 1, 2)
+                undistorted = cv2.undistortPoints(corners, intrinsics_matrix(intrinsics),
+                                                  distortion_vector(intrinsics)).reshape(-1, 2)
+                field_radius = 1.1 * float(np.max(np.linalg.norm(undistorted, axis=1)))
             for target_id, pt2d in det.detections.items():
                 pt3d = state.points.get(target_id)
                 if pt3d is None:
+                    continue
+                camera_point = rotation @ pt3d + abs_pose[3:]
+                if camera_point[2] <= 1e-9 or (
+                    field_radius is not None
+                    and np.hypot(camera_point[0], camera_point[1]) > field_radius * camera_point[2]
+                ):
+                    if unobservable is not None:
+                        unobservable.append((cam_name, stem, target_id, pt2d))
                     continue
                 residual = project_point(intrinsics, abs_pose, pt3d) - pt2d
                 if not np.all(np.isfinite(residual)):
@@ -2492,6 +2586,18 @@ def solve_multi_cam_bundle_adjustment(
         baseline_manifold = pyceres.SphereManifold(3)
         problem.set_manifold(translation, baseline_manifold)
 
+    # A single camera without control points or baseline keeps a free scale
+    # after the first pose is fixed (similarity about its centre).  Remove it
+    # with one constraint: hold the coordinate of the object point that is
+    # farthest from that centre along one axis.
+    if not fixed_point_ids and baseline_value is None and baseline_vector is None             and len(state.camera_names) == 1 and used_points:
+        centre = camera_center_from_pose(state.rig_poses[first_frame])
+        offsets = {tid: state.points[tid] - centre for tid in used_points}
+        gauge_id = max(offsets, key=lambda tid: float(np.max(np.abs(offsets[tid]))))
+        axis = int(np.argmax(np.abs(offsets[gauge_id])))
+        scale_gauge_manifold = pyceres.SubsetManifold(3, [axis])
+        problem.set_manifold(state.points[gauge_id], scale_gauge_manifold)
+
     # Fix known 3D points (metric ground truth)
     if fixed_point_ids:
         for tid in fixed_point_ids:
@@ -2619,7 +2725,11 @@ def save_multi_cam_colmap_output(
             quat = rotation_matrix_to_quaternion(R)
             qw, qx, qy, qz = float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2])
 
-            img_name = f"{cam_name}/{stem}.jpg"
+            img_name = next(
+                (f"{cam_name}/{det.image_path.name}" for det in detections_by_camera.get(cam_name, [])
+                 if det.image_path.stem == stem),
+                f"{cam_name}/{stem}.jpg",
+            )
             img_lines.append(
                 f"{colmap_img_id} {qw:.9f} {qx:.9f} {qy:.9f} {qz:.9f} "
                 f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} {cam_id_map[cam_name]} {img_name}"
@@ -3012,9 +3122,11 @@ def evaluate_independent_checkpoints(
         }
     return {"summary": summary, "targets": targets, "reprojection_observations": reprojection}
 
-def parse_combined_args() -> argparse.Namespace:
+def parse_combined_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Combined multi-camera CCT calibration: SfM initialisation -> CCT detection -> joint BA."
+        description="Combined CCT calibration of one camera or a multi-camera rig: initialisation -> "
+                    "CCT detection -> joint BA. A folder that directly contains images is calibrated "
+                    "as a single camera."
     )
     parser.add_argument(
         "--image-root", type=Path, required=True,
@@ -3077,23 +3189,30 @@ def parse_combined_args() -> argparse.Namespace:
         help="Also save every PDF report plot as a 600 dpi PNG in output-dir/plots/.",
     )
     parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Parallel image workers for detection, centre refinement and detection evaluation "
+             "(0 = automatic: up to 8, limited by the CPU count; 1 = sequential). Each worker holds one "
+             "image in memory.",
+    )
+    parser.add_argument(
         "--evaluate-detections", action="store_true", default=False,
         help="Developer diagnostic (requires --targets3d): project every reference target with "
              "the final calibration, report detection recall and suspect detections, and "
              "attribute each miss to the detector stage that rejected it. Writes "
              "detection_evaluation.json. Re-runs detection on images with misses.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_combined_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_combined_args(argv)
     image_root: Path = args.image_root.resolve()
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     baseline_value, baseline_vector = parse_known_baseline_argument(args.known_baseline)
     args.known_baseline = baseline_vector if baseline_vector is not None else baseline_value
+    workers = args.workers if args.workers > 0 else min(8, os.cpu_count() or 1)
 
     known_targets3d = load_targets3d(args.targets3d) if args.targets3d else None
     if not np.isfinite(args.checkpoints) or args.checkpoints < 0.0 or args.checkpoints >= 1.0:
@@ -3109,18 +3228,28 @@ def main() -> int:
         print("ERROR: --evaluate-detections requires --targets3d", flush=True)
         return 1
 
-    # Auto-detect cameras
-    if args.cameras:
+    # Auto-detect cameras.  A folder that directly contains images is one
+    # camera: the single-camera case is a rig with only the reference camera.
+    if list_images(image_root) and not args.cameras:
+        camera_names = [image_root.name]
+        image_root = image_root.parent
+    elif args.cameras:
         camera_names = args.cameras
     else:
-        camera_names = sorted(
-            d.name for d in image_root.iterdir()
-            if d.is_dir() and any(d.glob("*.jpg"))
-        )
-    if len(camera_names) < 2:
-        print(f"ERROR: need at least 2 cameras, found {camera_names}", flush=True)
+        camera_names = sorted(d.name for d in image_root.iterdir() if d.is_dir() and list_images(d))
+    if not camera_names:
+        print(f"ERROR: no images or camera folders with images found in {image_root}", flush=True)
         return 1
     print(f"cameras: {camera_names}", flush=True)
+    if known_targets3d is None:
+        print(
+            "WARNING: no --targets3d supplied. Calibration from coded targets with known coordinates is "
+            "strongly recommended; without them, initialisation relies on natural-feature SfM and the "
+            "targets become free object points"
+            + (", and for a single camera the scale is arbitrary (only the interior orientation is "
+               "meaningful)." if len(camera_names) == 1 else "."),
+            flush=True,
+        )
 
     # Resolve valid IDs
     valid_ids: Set[int] | None = None
@@ -3177,6 +3306,7 @@ def main() -> int:
         force=args.force_detections,
         initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
         codebook=codebook,
+        workers=workers,
     )
 
     if args.checkpoints > 0.0:
@@ -3199,6 +3329,7 @@ def main() -> int:
                 force=True,
                 initial_intrinsics=sfm_intrinsics if sfm_intrinsics else None,
                 codebook=codebook,
+                workers=workers,
             )
         else:
             print(
@@ -3294,10 +3425,17 @@ def main() -> int:
     print("STEP 4: Joint multi-camera bundle adjustment", flush=True)
     print("=" * 60, flush=True)
 
+    unobservable: List[Tuple[str, str, int, np.ndarray]] = []
     observations = multi_cam_collect_observations(
-        detections_by_camera, state, None,
+        detections_by_camera, state, None, unobservable=unobservable,
     )
     print(f"initial observations (ungated): {len(observations)}", flush=True)
+    if unobservable:
+        print(
+            f"  excluded {len(unobservable)} false identification(s): target behind the camera or outside "
+            "its field of view: " + ", ".join(f"{cam}/{stem}:{tid}" for cam, stem, tid, _ in unobservable),
+            flush=True,
+        )
     if len(observations) < 10:
         print("ERROR: not enough observations for bundle adjustment", flush=True)
         return 1
@@ -3324,6 +3462,7 @@ def main() -> int:
         valid_ids=valid_ids,
         max_id_hamming_distance=args.max_id_hamming_distance,
         codebook=codebook,
+        workers=workers,
     )
     center_update_history = [dict(center_updates)]
     # Checkpoint newly recovered ellipse evidence immediately. If a later BA
@@ -3392,6 +3531,19 @@ def main() -> int:
             f"    invalid metric residuals excluded: {filter_stats.invalid_observations}",
             flush=True,
         )
+    # A frame left with fewer observations than the initialization requires
+    # has an undetermined (or weakly determined) pose; drop it entirely.
+    frame_support: Dict[str, int] = {}
+    for _, stem, _, _ in observations:
+        frame_support[stem] = frame_support.get(stem, 0) + 1
+    dropped_frames = sorted(stem for stem, n in frame_support.items() if n < args.min_shared)
+    if dropped_frames:
+        observations = [item for item in observations if item[1] not in set(dropped_frames)]
+        print(
+            f"  dropped {len(dropped_frames)} frame(s) with fewer than {args.min_shared} retained "
+            f"observations: {', '.join(dropped_frames)}",
+            flush=True,
+        )
     if len(observations) < 10:
         print("ERROR: not enough inlier observations after robust filtering", flush=True)
         return 1
@@ -3428,6 +3580,7 @@ def main() -> int:
         valid_ids=valid_ids,
         max_id_hamming_distance=args.max_id_hamming_distance,
         codebook=codebook,
+        workers=workers,
     )
     center_update_history.append(dict(final_center_updates))
     if sum(final_center_updates.values()) > 0:
@@ -3475,6 +3628,7 @@ def main() -> int:
             valid_ids=valid_ids,
             max_id_hamming_distance=args.max_id_hamming_distance,
             codebook=codebook,
+            workers=workers,
         )
         for camera, images in posed_checkpoint_images.items():
             save_refinement_cache(images, output_dir / camera, merge_existing=True)
@@ -3499,7 +3653,8 @@ def main() -> int:
         from cct_calibration.detection_evaluation import evaluate_detections
         evaluate_detections(
             state, detections_by_camera, checkpoint_images, known_targets3d,
-            codebook, output_dir / "detection_evaluation.json",
+            codebook, output_dir / "detection_evaluation.json", workers=workers,
+            frame_stems={stem for _, stem, _, _ in observations},
         )
 
     (output_dir / "center_remeasurement.json").write_text(
@@ -3572,6 +3727,10 @@ def main() -> int:
             "tvec": rp[3:].tolist(),
         }
     overall["relative_poses"] = rel_poses_out
+    overall["frames_dropped_after_filtering"] = dropped_frames
+    overall["false_identifications_out_of_view"] = [
+        {"camera": cam, "frame": stem, "target_id": int(tid)} for cam, stem, tid, _ in unobservable
+    ]
     if checkpoint_quality is not None:
         overall["independent_checkpoint_quality"] = checkpoint_quality
 
@@ -3685,6 +3844,13 @@ def main() -> int:
                 "the camera-model change is below 0.02 px at p95 and 0.05 px maximum. "
                 "Counts are changed coordinates."
             )
+            if unobservable:
+                meta["False identifications (target out of view)"] = f"{len(unobservable)} excluded"
+            if dropped_frames:
+                meta["Frames dropped after filtering"] = (
+                    f"{len(dropped_frames)} with fewer than {args.min_shared} retained observations: "
+                    + ", ".join(dropped_frames)
+                )
             meta["Centre uncertainty"] = (
                 "Localisation covariance unavailable; adjustment uncertainty is conditional "
                 "on the final frozen image measurements."

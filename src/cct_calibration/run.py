@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -185,7 +186,10 @@ def normalize_target_id(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Calibrate a single camera from CCTDecode detections and pyceres bundle adjustment."
+        description="Calibrate a single camera from coded-target detections. Calibration runs the "
+                    "combined pipeline (run_combined.py) as its one-camera case, so it produces the same "
+                    "adjustment diagnostics and PDF report; any of its options (e.g. --checkpoints, "
+                    "--observation-sigma-px, --evaluate-detections, --no-pdf-report) may be added."
     )
     parser.add_argument(
         "--data-root",
@@ -288,11 +292,18 @@ def parse_args() -> argparse.Namespace:
         help="Run detection only, skip pose initialization and bundle adjustment, and export detections.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel image workers for detection, centre refinement and detection evaluation "
+             "(0 = automatic: up to 8, limited by the CPU count; 1 = sequential).",
+    )
+    parser.add_argument(
         "--force-detections",
         action="store_true",
         help="Re-run CCT detection even if cached target_detections.txt exists.",
     )
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 
 def iter_camera_images(data_root: Path, camera_name: str, image_root: Path | None = None) -> List[Path]:
@@ -582,6 +593,131 @@ def save_combined_target_detections(
     return output_path
 
 
+_WORKER_DETECTORS: Dict[Any, Any] = {}
+
+
+def _detector_for(codebook: Set[int] | None):
+    """One detector per process and codebook (codebook templates are built once)."""
+    key = frozenset(codebook) if codebook is not None else None
+    if key not in _WORKER_DETECTORS:
+        _WORKER_DETECTORS[key] = _CCTDetector(n_bits=14, codebook=codebook)
+    return _WORKER_DETECTORS[key]
+
+
+def _init_detection_worker() -> None:
+    # Parallelism comes from the process pool; avoid oversubscribing cores.
+    cv2.setNumThreads(1)
+
+
+def _detect_image(
+    image_index: int,
+    image_path: Path,
+    detections_output_dir: Path | None,
+    valid_ids: Set[int] | None,
+    max_id_hamming_distance: int,
+    initial_intrinsics: np.ndarray | None,
+    codebook: Set[int] | None,
+):
+    """Detect, identify and package the targets of one image (process-safe).
+
+    Returns None for an unreadable image, otherwise
+    (width, height, ImageDetections or None, diagnostics entry or None).
+    """
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return None
+    height, width = image.shape[:2]
+    detector = _detector_for(codebook)
+    kept = None
+    production_diagnostics: list[dict[str, Any]] = []
+    if hasattr(detector, "detect_with_diagnostics"):
+        detections, detector_diag = detector.detect_with_diagnostics(image, intrinsics=initial_intrinsics)
+    else:
+        detections = detector.detect(image)
+        detector_diag = None
+
+    grouped: Dict[int, List[np.ndarray]] = {}
+    grouped_records: Dict[int, List[Any]] = {}
+    accepted_for_annotation = []
+    rejected_ids = 0
+    corrected_ids = 0
+    for det in detections:
+        raw_id = det.target_id
+        target_id, corrected = normalize_target_id(raw_id, valid_ids, max_id_hamming_distance)
+        if target_id is None:
+            rejected_ids += 1
+            continue
+        corrected_ids += int(corrected)
+        # Do not draw raw decoder IDs that are rejected by the configured
+        # target codebook/range.  The production overlay must show the
+        # same observations that can enter calibration; when a permitted
+        # Hamming correction is used, display the corrected ID.
+        accepted = replace(det, target_id=int(target_id))
+        accepted_for_annotation.append(accepted)
+        grouped_records.setdefault(target_id, []).append(accepted)
+        grouped.setdefault(target_id, []).append(
+            np.array([det.center[0], det.center[1]], dtype=np.float64)
+        )
+
+    merge_radius = max(width, height) * 0.01
+    unique_detections: Dict[int, np.ndarray] = {}
+    for target_id, points in grouped.items():
+        merged = merge_duplicate_detections(points, merge_radius)
+        if merged is not None:
+            unique_detections[target_id] = merged
+
+    if detector_diag is not None:
+        production_diagnostics.append({
+            "image": image_path.name,
+            "counts": dict(detector_diag.counts),
+            "valid_id_rejections": int(rejected_ids),
+            "hamming_corrections": int(corrected_ids),
+            "duplicate_id_groups": int(max(0, len(grouped) - len(unique_detections))),
+            "rejected": list(getattr(detector_diag, "rejected", [])),
+        })
+
+    if detections_output_dir is not None:
+        annotated = detector.annotate(image, accepted_for_annotation)
+        save_annotated_detection_image(detections_output_dir / image_path.name, annotated)
+
+    if unique_detections:
+        raw_detections: Dict[int, np.ndarray] = {}
+        refinement_ellipses: Dict[int, tuple] = {}
+        refinement_status: Dict[int, Dict[str, Any]] = {}
+        for target_id in unique_detections:
+            candidates = grouped_records.get(target_id, [])
+            if len(candidates) != 1:
+                continue
+            detection = candidates[0]
+            ellipse_center = detection.ellipse_center or detection.ellipse[0]
+            raw_detections[target_id] = np.asarray(ellipse_center, dtype=np.float64)
+            refinement_ellipses[target_id] = detection.ellipse
+            refinement_status[target_id] = {
+                "method": detection.center_method,
+                "intrinsics": (
+                    [float(value) for value in initial_intrinsics]
+                    if initial_intrinsics is not None and detection.center_method != "ellipse"
+                    else None
+                ),
+                "reason": "verified during production detection",
+            }
+        kept = (
+            ImageDetections(
+                image_path=image_path,
+                image_index=image_index,
+                width=width,
+                height=height,
+                detections=unique_detections,
+                raw_detections=raw_detections,
+                refinement_ellipses=refinement_ellipses,
+                refinement_status=refinement_status,
+                raw_cache_verified=True,
+            )
+        )
+
+    return width, height, kept, (production_diagnostics[0] if production_diagnostics else None)
+
+
 def _load_detections_cct_detect(
     image_paths: Sequence[Path],
     detections_output_dir: Path | None,
@@ -589,119 +725,56 @@ def _load_detections_cct_detect(
     max_id_hamming_distance: int,
     initial_intrinsics: np.ndarray | None = None,
     codebook: Set[int] | None = None,
+    workers: int = 1,
 ) -> List[ImageDetections]:
     """Detection path using the modern cct_detect detector with affine rectification.
 
     ``codebook`` (the valid target IDs, known when reference coordinates are
     supplied) switches the decoder to correlation against those codes;
-    without it the generic decoder is used.
+    without it the generic decoder is used.  Images are independent, so with
+    ``workers`` > 1 they are processed in parallel worker processes; results
+    are identical and kept in input order.
     """
-    detector = _CCTDetector(n_bits=14, codebook=codebook)
+    from concurrent.futures import ProcessPoolExecutor
+
+    arguments = [
+        (index, path, detections_output_dir, valid_ids, max_id_hamming_distance, initial_intrinsics, codebook)
+        for index, path in enumerate(image_paths)
+    ]
+    workers = max(1, min(int(workers), len(arguments)))
+    pool = None
+    if workers > 1:
+        print(f"detecting with {workers} worker processes", flush=True)
+        pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_detection_worker)
+        results = pool.map(_detect_image, *zip(*arguments))
+    else:
+        results = (_detect_image(*item) for item in arguments)
+
     kept: List[ImageDetections] = []
     production_diagnostics: list[dict[str, Any]] = []
     expected_size: tuple[int, int] | None = None
-    for image_index, image_path in enumerate(image_paths):
-        image = cv2.imread(str(image_path))
-        if image is None:
-            continue
-        height, width = image.shape[:2]
-        if expected_size is None:
-            expected_size = (width, height)
-        elif expected_size != (width, height):
-            raise ValueError(
-                f"Image size mismatch for {image_path}: {(width, height)} != {expected_size}"
-            )
-
-        if hasattr(detector, "detect_with_diagnostics"):
-            detections, detector_diag = detector.detect_with_diagnostics(image, intrinsics=initial_intrinsics)
-        else:
-            detections = detector.detect(image)
-            detector_diag = None
-
-        grouped: Dict[int, List[np.ndarray]] = {}
-        grouped_records: Dict[int, List[Any]] = {}
-        accepted_for_annotation = []
-        rejected_ids = 0
-        corrected_ids = 0
-        for det in detections:
-            raw_id = det.target_id
-            target_id, corrected = normalize_target_id(raw_id, valid_ids, max_id_hamming_distance)
-            if target_id is None:
-                rejected_ids += 1
-                continue
-            corrected_ids += int(corrected)
-            # Do not draw raw decoder IDs that are rejected by the configured
-            # target codebook/range.  The production overlay must show the
-            # same observations that can enter calibration; when a permitted
-            # Hamming correction is used, display the corrected ID.
-            accepted = replace(det, target_id=int(target_id))
-            accepted_for_annotation.append(accepted)
-            grouped_records.setdefault(target_id, []).append(accepted)
-            grouped.setdefault(target_id, []).append(
-                np.array([det.center[0], det.center[1]], dtype=np.float64)
-            )
-
-        merge_radius = max(width, height) * 0.01
-        unique_detections: Dict[int, np.ndarray] = {}
-        for target_id, points in grouped.items():
-            merged = merge_duplicate_detections(points, merge_radius)
-            if merged is not None:
-                unique_detections[target_id] = merged
-
-        if detector_diag is not None:
-            production_diagnostics.append({
-                "image": image_path.name,
-                "counts": dict(detector_diag.counts),
-                "valid_id_rejections": int(rejected_ids),
-                "hamming_corrections": int(corrected_ids),
-                "duplicate_id_groups": int(max(0, len(grouped) - len(unique_detections))),
-                "rejected": list(getattr(detector_diag, "rejected", [])),
-            })
-
-        if detections_output_dir is not None:
-            annotated = detector.annotate(image, accepted_for_annotation)
-            save_annotated_detection_image(detections_output_dir / image_path.name, annotated)
-
-        if unique_detections:
-            raw_detections: Dict[int, np.ndarray] = {}
-            refinement_ellipses: Dict[int, tuple] = {}
-            refinement_status: Dict[int, Dict[str, Any]] = {}
-            for target_id in unique_detections:
-                candidates = grouped_records.get(target_id, [])
-                if len(candidates) != 1:
-                    continue
-                detection = candidates[0]
-                ellipse_center = detection.ellipse_center or detection.ellipse[0]
-                raw_detections[target_id] = np.asarray(ellipse_center, dtype=np.float64)
-                refinement_ellipses[target_id] = detection.ellipse
-                refinement_status[target_id] = {
-                    "method": detection.center_method,
-                    "intrinsics": (
-                        [float(value) for value in initial_intrinsics]
-                        if initial_intrinsics is not None and detection.center_method != "ellipse"
-                        else None
-                    ),
-                    "reason": "verified during production detection",
-                }
-            kept.append(
-                ImageDetections(
-                    image_path=image_path,
-                    image_index=image_index,
-                    width=width,
-                    height=height,
-                    detections=unique_detections,
-                    raw_detections=raw_detections,
-                    refinement_ellipses=refinement_ellipses,
-                    refinement_status=refinement_status,
-                    raw_cache_verified=True,
+    try:
+        for (image_index, image_path, *_), result in zip(arguments, results):
+            if result is not None:
+                width, height, image_detections, diagnostics_entry = result
+                if expected_size is None:
+                    expected_size = (width, height)
+                elif expected_size != (width, height):
+                    raise ValueError(
+                        f"Image size mismatch for {image_path}: {(width, height)} != {expected_size}"
+                    )
+                if diagnostics_entry is not None:
+                    production_diagnostics.append(diagnostics_entry)
+                if image_detections is not None:
+                    kept.append(image_detections)
+            if (image_index + 1) % 20 == 0 or image_index + 1 == len(image_paths):
+                print(
+                    f"processed {image_index + 1}/{len(image_paths)} images, kept {len(kept)}",
+                    flush=True,
                 )
-            )
-
-        if (image_index + 1) % 20 == 0 or image_index + 1 == len(image_paths):
-            print(
-                f"processed {image_index + 1}/{len(image_paths)} images, kept {len(kept)}",
-                flush=True,
-            )
+    finally:
+        if pool is not None:
+            pool.shutdown(cancel_futures=True)
 
     if detections_output_dir is not None and production_diagnostics:
         detections_output_dir.mkdir(parents=True, exist_ok=True)
@@ -718,6 +791,7 @@ def load_image_detections(
     max_id_hamming_distance: int = 0,
     initial_intrinsics: np.ndarray | None = None,
     codebook: Set[int] | None = None,
+    workers: int = 1,
 ) -> List[ImageDetections]:
     return _load_detections_cct_detect(
         image_paths,
@@ -726,6 +800,7 @@ def load_image_detections(
         max_id_hamming_distance,
         initial_intrinsics,
         codebook=codebook,
+        workers=workers,
     )
 
 
@@ -2026,6 +2101,7 @@ def detect_camera(
     max_id_hamming_distance: int,
     force_detections: bool,
     codebook: Set[int] | None = None,
+    workers: int = 1,
 ) -> tuple[DetectionOnlyResult, List[ImageDetections]]:
     image_paths = iter_camera_images(data_root, camera_name, image_root)
     if not image_paths:
@@ -2042,6 +2118,7 @@ def detect_camera(
             valid_ids=valid_ids,
             max_id_hamming_distance=max_id_hamming_distance,
             codebook=codebook,
+            workers=workers,
         )
         target_detections_path = save_target_detections(images, camera_name, output_dir)
     else:
@@ -2104,8 +2181,51 @@ def format_detection_result(result: DetectionOnlyResult) -> dict:
     }
 
 
+def calibrate_with_combined_pipeline(args: argparse.Namespace, extra_args: Sequence[str]) -> int:
+    """Single-camera calibration as the one-camera case of the combined pipeline."""
+    from cct_calibration.run_combined import main as combined_main
+
+    if args.image_root is None:
+        print("ERROR: calibration needs --image-root pointing to a folder with the images of one camera; "
+              "the legacy --data-root photos_* layout is only supported with --detect-only.", flush=True)
+        return 1
+    if args.cameras and args.cameras != [args.image_root.resolve().name]:
+        print(f"note: the camera is named after its image folder ({args.image_root.resolve().name}).", flush=True)
+    if args.show_3d:
+        print("note: --show-3d is not available in the combined pipeline; inspect <output-dir>/colmap instead.",
+              flush=True)
+    argv = [
+        "--image-root", str(args.image_root), "--output-dir", str(args.output_dir),
+        # This entry point kept images with *more than* N detections; the combined one uses >= N.
+        "--min-detections", str(args.min_detections + 1),
+        "--min-shared", str(args.min_shared),
+        "--max-reprojection-error", str(args.max_reprojection_error),
+        "--max-iterations", str(args.max_iterations),
+        "--huber-delta", str(args.huber_delta),
+        "--loss-tolerance", str(args.loss_relative_tolerance),
+        "--loss-patience", str(args.loss_patience),
+        "--max-id-hamming-distance", str(args.max_id_hamming_distance),
+        "--workers", str(args.workers),
+    ]
+    if args.targets3d is not None:
+        # As before, known targets initialise the camera directly (no SfM).
+        argv += ["--targets3d", str(args.targets3d), "--skip-sfm"]
+    if args.valid_ids_file is not None:
+        argv += ["--valid-ids-file", str(args.valid_ids_file)]
+    if args.valid_id_max is not None:
+        argv += ["--valid-id-max", str(args.valid_id_max)]
+    if args.force_detections:
+        argv.append("--force-detections")
+    return combined_main([*argv, *[a for a in extra_args if a != "--skip-sfm" or args.targets3d is None]])
+
+
 def main() -> int:
-    args = parse_args()
+    args, extra_args = parse_args()
+    if not args.detect_only:
+        return calibrate_with_combined_pipeline(args, extra_args)
+    if extra_args:
+        print(f"ERROR: unrecognized arguments for --detect-only: {' '.join(extra_args)}", flush=True)
+        return 2
     known_targets3d = load_targets3d(args.targets3d) if args.targets3d is not None else None
     valid_ids = resolve_valid_ids(args.valid_ids_file, args.valid_id_max)
     if valid_ids is None and known_targets3d is not None:
@@ -2133,6 +2253,7 @@ def main() -> int:
                 max_id_hamming_distance=args.max_id_hamming_distance,
                 force_detections=args.force_detections,
                 codebook=valid_ids if known_targets3d is not None else None,
+                workers=args.workers if args.workers > 0 else min(8, os.cpu_count() or 1),
             )
             result_dict = format_detection_result(result)
             detection_results.append(result_dict)

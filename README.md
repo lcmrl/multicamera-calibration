@@ -47,10 +47,7 @@ The image file names should match across cameras so the pipeline can associate t
 
 ### Single camera
 
-For single-camera calibration, you can use either:
-
-- the original `photos_*` layout, or
-- a flat folder of images.
+For single-camera calibration, use a flat folder of images (the legacy `photos_*` layout is only supported with `--detect-only`).
 
 Example flat-folder layout:
 
@@ -127,7 +124,9 @@ uv run python run_cct_calibration.py \
   --targets3d "reference.txt"
 ```
 
-This is the standard mono workflow for a flat image folder. The solver uses the known target coordinates directly rather than relying on a separate SfM stage.
+This is the standard mono workflow for a flat image folder. A single camera is calibrated as the one-camera case of the combined pipeline: the same centre refinement, staged adjustment, covariance diagnostics, optional checkpoints and PDF report are used, and only rig-specific results (relative orientation, stereo diagnostics) are omitted. With `--targets3d`, the camera is initialized from the known targets (no SfM). Any option of `run_combined.py` (e.g. `--checkpoints`, `--observation-sigma-px`, `--evaluate-detections`, `--no-pdf-report`) can be added. `run_combined.py --image-root <folder of images>` is equivalent.
+
+Calibrating without `--targets3d` is possible but not recommended and prints a warning: initialization then uses natural-feature SfM, targets become free object points, and the scale of a single-camera solution is arbitrary (only the interior orientation is meaningful).
 
 ### 5. Detection-only mode
 
@@ -151,6 +150,7 @@ This runs detection only and exports the detections without performing pose init
 - `--checkpoints [RATIO]`: optionally withhold complete target IDs from target-based initialization and every calibration bundle for final independent accuracy checks. With no ratio it uses `0.2`; `--checkpoints 0` preserves the ordinary workflow. Checkpoint runs restore original detector coordinates from the cache so refined centers from an earlier target partition cannot leak into the experiment; only legacy or incomplete caches require a one-time redetection.
 - `--checkpoint-seed`: reproducible integer seed for checkpoint selection (default `42`). The selected IDs and realised ratio are written to `checkpoint_split.json`.
 - `--force-detections`: ignore existing detection cache files and rerun target detection.
+- `--workers`: number of parallel image-processing workers for target detection, calibrated centre refinement and `--evaluate-detections` (default `0` = automatic, up to 8 limited by the CPU count; `1` = sequential). Results are identical; each worker holds one image in memory, so lower it for very large images on machines with little RAM.
 
 ### Multi-camera flags
 
@@ -176,10 +176,10 @@ This runs detection only and exports the detections without performing pose init
 
 ### Single-camera flags
 
-- `--data-root`: root directory containing the original `photos_*` folders.
-- `--camera`: camera name to process. With `--image-root`, you can omit it and the folder name will be used.
+- `--data-root`: root directory containing the legacy `photos_*` folders (`--detect-only` only).
+- `--camera`: camera name for `--detect-only`; for calibration the camera is named after its image folder.
 - `--detect-only`: run detection only and skip initialization and bundle adjustment.
-- `--show-3d`: open a Rerun visualization after calibration if the optional viewer is installed.
+- `--show-3d`: no longer available for calibration; inspect `<output-dir>/colmap` instead.
 
 ## Caching behavior
 
@@ -187,7 +187,7 @@ The pipeline reuses previous intermediate results where possible.
 
 - Multi-camera detections are cached under each camera output folder as `target_detections.txt`.
 - Multi-camera SfM is cached under the output directory in the `sfm/` folder.
-- Single-camera detections are cached in the output directory for the selected camera.
+- Single-camera detections are cached the same way, under `<output-dir>/<camera>/`.
 
 Use `--force-detections` or `--force-sfm` when you want to rebuild those intermediate results from scratch.
 
@@ -224,14 +224,7 @@ Typical outputs include:
 
 ### Single-camera outputs
 
-Typical outputs include:
-
-- `<camera>_summary.json`
-- `<camera>_report.txt`
-- `<camera>_convergence.png`
-- `<camera>_scene.npz`
-- `<camera>.rrd`
-- per-camera detection and annotation files
+The same files as for a multi-camera rig (`combined_summary.json`, `report.txt`, `calibration_report.pdf`, `camchain.yaml`, `colmap/`, detection folders and caches), without the rig-specific content.
 
 The reports contain reprojection error in pixels and, when available, object-space error in meters.
 
